@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static void set_error(char *err, size_t err_size, const char *fmt, ...) {
@@ -62,6 +63,261 @@ static char *path_join(const char *base, const char *relative_path) {
     return joined;
 }
 
+static bool env_flag_enabled(const char *name) {
+    const char *value = getenv(name);
+
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static bool path_uses_gio(const char *path) {
+    if (env_flag_enabled("SUBSYNC_FORCE_GIO")) {
+        return true;
+    }
+
+    return path != NULL &&
+           strncmp(path, "/run/user/", 10) == 0 &&
+           strstr(path, "/gvfs/") != NULL;
+}
+
+static void trim_trailing_newlines(char *value) {
+    size_t len;
+
+    if (value == NULL) {
+        return;
+    }
+
+    len = strlen(value);
+    while (len > 0 && (value[len - 1] == '\n' || value[len - 1] == '\r')) {
+        value[len - 1] = '\0';
+        --len;
+    }
+}
+
+static bool name_has_known_mtp_problem(const char *name) {
+    return name != NULL && strchr(name, ':') != NULL;
+}
+
+static int validate_known_mtp_constraints(
+    const char *target_path,
+    const char *display_name,
+    char *err,
+    size_t err_size
+) {
+    if (!path_uses_gio(target_path)) {
+        return 0;
+    }
+
+    if (name_has_known_mtp_problem(display_name)) {
+        set_error(
+            err,
+            err_size,
+            "Android MTP rejected '%s'. The filename contains ':', which many phone storage backends do not allow.",
+            display_name
+        );
+        return -1;
+    }
+
+    return 0;
+}
+
+static int run_command_capture_stderr(const char *const argv[], char *err, size_t err_size) {
+    int pipe_fds[2];
+    int devnull_fd = -1;
+    pid_t pid;
+    int status;
+    char *stderr_buffer = NULL;
+    size_t used = 0;
+    size_t capacity = 0;
+    char chunk[256];
+    ssize_t bytes_read;
+
+    if (pipe(pipe_fds) != 0) {
+        set_error(err, err_size, "Cannot create subprocess pipe: %s", strerror(errno));
+        return -1;
+    }
+
+    devnull_fd = open("/dev/null", O_RDONLY);
+    if (devnull_fd < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        set_error(err, err_size, "Cannot open /dev/null: %s", strerror(errno));
+        return -1;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        close(devnull_fd);
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        set_error(err, err_size, "Cannot fork subprocess: %s", strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pipe_fds[0]);
+
+        if (dup2(devnull_fd, STDIN_FILENO) < 0) {
+            dprintf(pipe_fds[1], "dup2 failed: %s\n", strerror(errno));
+            _exit(127);
+        }
+        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) {
+            dprintf(pipe_fds[1], "dup2 failed: %s\n", strerror(errno));
+            _exit(127);
+        }
+        if (dup2(pipe_fds[1], STDERR_FILENO) < 0) {
+            dprintf(pipe_fds[1], "dup2 failed: %s\n", strerror(errno));
+            _exit(127);
+        }
+
+        close(devnull_fd);
+        close(pipe_fds[1]);
+        execvp(argv[0], (char *const *)argv);
+        dprintf(STDERR_FILENO, "Cannot run %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    close(devnull_fd);
+    close(pipe_fds[1]);
+
+    while ((bytes_read = read(pipe_fds[0], chunk, sizeof(chunk))) > 0) {
+        if (used + (size_t)bytes_read + 1 > capacity) {
+            size_t next_capacity = capacity == 0 ? 512 : capacity;
+            char *grown;
+
+            while (used + (size_t)bytes_read + 1 > next_capacity) {
+                next_capacity *= 2;
+            }
+
+            grown = realloc(stderr_buffer, next_capacity);
+            if (grown == NULL) {
+                free(stderr_buffer);
+                close(pipe_fds[0]);
+                waitpid(pid, NULL, 0);
+                set_error(err, err_size, "Out of memory while reading subprocess output");
+                return -1;
+            }
+
+            stderr_buffer = grown;
+            capacity = next_capacity;
+        }
+
+        memcpy(stderr_buffer + used, chunk, (size_t)bytes_read);
+        used += (size_t)bytes_read;
+    }
+    close(pipe_fds[0]);
+
+    if (bytes_read < 0) {
+        free(stderr_buffer);
+        set_error(err, err_size, "Cannot read subprocess output: %s", strerror(errno));
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+
+    if (stderr_buffer == NULL) {
+        stderr_buffer = calloc(1, 1);
+        if (stderr_buffer == NULL) {
+            waitpid(pid, NULL, 0);
+            set_error(err, err_size, "Out of memory while reading subprocess output");
+            return -1;
+        }
+    }
+    stderr_buffer[used] = '\0';
+    trim_trailing_newlines(stderr_buffer);
+
+    if (waitpid(pid, &status, 0) < 0) {
+        free(stderr_buffer);
+        set_error(err, err_size, "Cannot wait for subprocess: %s", strerror(errno));
+        return -1;
+    }
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        free(stderr_buffer);
+        return 0;
+    }
+
+    if (stderr_buffer[0] != '\0') {
+        set_error(err, err_size, "%s", stderr_buffer);
+    } else if (WIFEXITED(status)) {
+        set_error(err, err_size, "%s exited with status %d", argv[0], WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        set_error(err, err_size, "%s terminated by signal %d", argv[0], WTERMSIG(status));
+    } else {
+        set_error(err, err_size, "%s failed", argv[0]);
+    }
+
+    free(stderr_buffer);
+    return -1;
+}
+
+static int gio_make_directory_with_parents(const char *path, char *err, size_t err_size) {
+    const char *argv[] = {"gio", "mkdir", "-p", path, NULL};
+
+    return run_command_capture_stderr(argv, err, err_size);
+}
+
+static int gio_remove_path(const char *path, char *err, size_t err_size) {
+    const char *argv[] = {"gio", "remove", "-f", path, NULL};
+
+    return run_command_capture_stderr(argv, err, err_size);
+}
+
+static int gio_copy_file(const char *source_path, const char *target_path, char *err, size_t err_size) {
+    const char *argv[] = {"gio", "copy", "-T", "--default-permissions", source_path, target_path, NULL};
+
+    return run_command_capture_stderr(argv, err, err_size);
+}
+
+static const char *path_basename(const char *path) {
+    const char *slash;
+
+    if (path == NULL) {
+        return "";
+    }
+
+    slash = strrchr(path, '/');
+    return slash == NULL ? path : slash + 1;
+}
+
+static void rewrite_gvfs_error_if_needed(
+    const char *source_path,
+    const char *target_path,
+    char *err,
+    size_t err_size
+) {
+    const char *source_name;
+
+    if (err == NULL || err[0] == '\0') {
+        return;
+    }
+
+    if (!path_uses_gio(target_path)) {
+        return;
+    }
+
+    source_name = path_basename(source_path);
+
+    if (strstr(err, "libmtp error:  Could not send object.") != NULL &&
+        name_has_known_mtp_problem(source_name)) {
+        set_error(
+            err,
+            err_size,
+            "Android MTP rejected '%s'. The filename contains ':', which many phone storage backends do not allow.",
+            source_name
+        );
+        return;
+    }
+
+    if (strstr(err, "libmtp error") != NULL) {
+        set_error(
+            err,
+            err_size,
+            "MTP transfer failed for '%s': %s",
+            source_name,
+            err
+        );
+    }
+}
+
 static int ensure_directory_recursive(const char *path, char *err, size_t err_size) {
     struct stat st;
     char *parent;
@@ -82,6 +338,10 @@ static int ensure_directory_recursive(const char *path, char *err, size_t err_si
     if (errno != ENOENT) {
         set_error(err, err_size, "Cannot inspect '%s': %s", path, strerror(errno));
         return -1;
+    }
+
+    if (path_uses_gio(path)) {
+        return gio_make_directory_with_parents(path, err, err_size);
     }
 
     parent = dup_string(path);
@@ -108,6 +368,9 @@ static int ensure_directory_recursive(const char *path, char *err, size_t err_si
     free(parent);
 
     if (mkdir(path, 0777) != 0 && errno != EEXIST) {
+        if (errno == EOPNOTSUPP || errno == ENOSYS) {
+            return gio_make_directory_with_parents(path, err, err_size);
+        }
         set_error(err, err_size, "Cannot create directory '%s': %s", path, strerror(errno));
         return -1;
     }
@@ -154,7 +417,14 @@ static int remove_path_recursive(const char *path, char *err, size_t err_size) {
     }
 
     if (!S_ISDIR(st.st_mode)) {
-        if (unlink(path) != 0) {
+        if (path_uses_gio(path)) {
+            if (gio_remove_path(path, err, err_size) != 0) {
+                return -1;
+            }
+        } else if (unlink(path) != 0) {
+            if (errno == EOPNOTSUPP || errno == ENOSYS) {
+                return gio_remove_path(path, err, err_size);
+            }
             set_error(err, err_size, "Cannot remove '%s': %s", path, strerror(errno));
             return -1;
         }
@@ -201,7 +471,14 @@ static int remove_path_recursive(const char *path, char *err, size_t err_size) {
         return -1;
     }
 
-    if (rmdir(path) != 0) {
+    if (path_uses_gio(path)) {
+        if (gio_remove_path(path, err, err_size) != 0) {
+            return -1;
+        }
+    } else if (rmdir(path) != 0) {
+        if (errno == EOPNOTSUPP || errno == ENOSYS) {
+            return gio_remove_path(path, err, err_size);
+        }
         set_error(err, err_size, "Cannot remove directory '%s': %s", path, strerror(errno));
         return -1;
     }
@@ -242,6 +519,14 @@ static int copy_file_contents(const char *source_path, const char *target_path, 
         return -1;
     }
 
+    if (path_uses_gio(source_path) || path_uses_gio(target_path)) {
+        int rc = gio_copy_file(source_path, target_path, err, err_size);
+        if (rc != 0) {
+            rewrite_gvfs_error_if_needed(source_path, target_path, err, err_size);
+        }
+        return rc;
+    }
+
     source_fd = open(source_path, O_RDONLY);
     if (source_fd < 0) {
         set_error(err, err_size, "Cannot open '%s': %s", source_path, strerror(errno));
@@ -256,6 +541,16 @@ static int copy_file_contents(const char *source_path, const char *target_path, 
 
     target_fd = open(target_path, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
     if (target_fd < 0) {
+        if (errno == EOPNOTSUPP || errno == ENOSYS) {
+            int rc;
+
+            close(source_fd);
+            rc = gio_copy_file(source_path, target_path, err, err_size);
+            if (rc != 0) {
+                rewrite_gvfs_error_if_needed(source_path, target_path, err, err_size);
+            }
+            return rc;
+        }
         set_error(err, err_size, "Cannot create '%s': %s", target_path, strerror(errno));
         close(source_fd);
         return -1;
@@ -309,6 +604,12 @@ static int copy_source_node_recursive(
         free(source_path);
         free(target_path);
         set_error(err, err_size, "Out of memory while copying '%s'", node->name);
+        return -1;
+    }
+
+    if (validate_known_mtp_constraints(target_path, node->name, err, err_size) != 0) {
+        free(source_path);
+        free(target_path);
         return -1;
     }
 
