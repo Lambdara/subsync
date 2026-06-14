@@ -69,7 +69,7 @@ static bool env_flag_enabled(const char *name) {
     return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
-static bool path_uses_gio(const char *path) {
+bool subsync_target_uses_gio(const char *path) {
     if (env_flag_enabled("SUBSYNC_FORCE_GIO")) {
         return true;
     }
@@ -103,7 +103,7 @@ static int validate_known_mtp_constraints(
     char *err,
     size_t err_size
 ) {
-    if (!path_uses_gio(target_path)) {
+    if (!subsync_target_uses_gio(target_path)) {
         return 0;
     }
 
@@ -290,7 +290,7 @@ static void rewrite_gvfs_error_if_needed(
         return;
     }
 
-    if (!path_uses_gio(target_path)) {
+    if (!subsync_target_uses_gio(target_path)) {
         return;
     }
 
@@ -340,7 +340,7 @@ static int ensure_directory_recursive(const char *path, char *err, size_t err_si
         return -1;
     }
 
-    if (path_uses_gio(path)) {
+    if (subsync_target_uses_gio(path)) {
         return gio_make_directory_with_parents(path, err, err_size);
     }
 
@@ -417,7 +417,7 @@ static int remove_path_recursive(const char *path, char *err, size_t err_size) {
     }
 
     if (!S_ISDIR(st.st_mode)) {
-        if (path_uses_gio(path)) {
+        if (subsync_target_uses_gio(path)) {
             if (gio_remove_path(path, err, err_size) != 0) {
                 return -1;
             }
@@ -471,7 +471,7 @@ static int remove_path_recursive(const char *path, char *err, size_t err_size) {
         return -1;
     }
 
-    if (path_uses_gio(path)) {
+    if (subsync_target_uses_gio(path)) {
         if (gio_remove_path(path, err, err_size) != 0) {
             return -1;
         }
@@ -519,7 +519,7 @@ static int copy_file_contents(const char *source_path, const char *target_path, 
         return -1;
     }
 
-    if (path_uses_gio(source_path) || path_uses_gio(target_path)) {
+    if (subsync_target_uses_gio(source_path) || subsync_target_uses_gio(target_path)) {
         int rc = gio_copy_file(source_path, target_path, err, err_size);
         if (rc != 0) {
             rewrite_gvfs_error_if_needed(source_path, target_path, err, err_size);

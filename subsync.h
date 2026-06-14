@@ -53,6 +53,7 @@ Tree *tree_build(const char *source_root, const char *target_root, char *err, si
 void tree_free(Tree *tree);
 Node *tree_find_source_node(Node *root, const char *relative_path);
 size_t tree_collect_visible(Node *root, bool show_target_only, VisibleRow **out_rows);
+bool subsync_target_uses_gio(const char *path);
 
 int copy_source_node_to_target(
     const char *source_root,

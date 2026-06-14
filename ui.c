@@ -3,6 +3,9 @@
 
 #include "subsync.h"
 
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
 #include <ncurses.h>
 #include <stdarg.h>
@@ -10,6 +13,29 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+typedef enum {
+    JOB_COPY,
+    JOB_REMOVE
+} JobAction;
+
+typedef enum {
+    JOB_PENDING,
+    JOB_RUNNING
+} JobState;
+
+typedef struct {
+    pid_t pid;
+    int result_fd;
+    char *relative_path;
+    JobAction action;
+    JobState state;
+    size_t file_count;
+    unsigned long long byte_count;
+} TransferJob;
 
 typedef struct {
     char *source_root;
@@ -18,6 +44,9 @@ typedef struct {
     bool show_target_only;
     size_t selected_index;
     size_t scroll_offset;
+    TransferJob *jobs;
+    size_t job_count;
+    size_t job_capacity;
     char status[512];
 } UiState;
 
@@ -26,6 +55,8 @@ typedef struct {
     size_t count;
     size_t capacity;
 } StringList;
+
+static int reload_tree(UiState *ui, const char *selected_path);
 
 static void set_status(UiState *ui, const char *fmt, ...) {
     va_list args;
@@ -45,6 +76,507 @@ static char *dup_string(const char *value) {
 
     memcpy(copy, value, len + 1);
     return copy;
+}
+
+static char *path_join(const char *base, const char *relative_path) {
+    size_t base_len;
+    size_t rel_len;
+    char *joined;
+
+    if (relative_path == NULL || relative_path[0] == '\0') {
+        return dup_string(base);
+    }
+
+    base_len = strlen(base);
+    rel_len = strlen(relative_path);
+    joined = malloc(base_len + rel_len + 2);
+    if (joined == NULL) {
+        return NULL;
+    }
+
+    memcpy(joined, base, base_len);
+    joined[base_len] = '/';
+    memcpy(joined + base_len + 1, relative_path, rel_len + 1);
+    return joined;
+}
+
+static bool path_is_same_or_nested(const char *left, const char *right) {
+    size_t left_len;
+
+    if (left == NULL || right == NULL) {
+        return false;
+    }
+
+    left_len = strlen(left);
+    if (left_len == 0) {
+        return true;
+    }
+
+    if (strncmp(left, right, left_len) != 0) {
+        return false;
+    }
+
+    return right[left_len] == '\0' || right[left_len] == '/';
+}
+
+static bool paths_overlap(const char *left, const char *right) {
+    return path_is_same_or_nested(left, right) || path_is_same_or_nested(right, left);
+}
+
+static const char *action_label(JobAction action) {
+    return action == JOB_COPY ? "copy" : "remove";
+}
+
+static const char *job_state_label(JobState state) {
+    return state == JOB_RUNNING ? "running" : "queued";
+}
+
+static void free_job(TransferJob *job) {
+    if (job == NULL) {
+        return;
+    }
+
+    if (job->result_fd >= 0) {
+        close(job->result_fd);
+    }
+    free(job->relative_path);
+}
+
+static void free_jobs(UiState *ui) {
+    size_t i;
+
+    for (i = 0; i < ui->job_count; ++i) {
+        free_job(&ui->jobs[i]);
+    }
+    free(ui->jobs);
+    ui->jobs = NULL;
+    ui->job_count = 0;
+    ui->job_capacity = 0;
+}
+
+static bool has_running_job(const UiState *ui) {
+    size_t i;
+
+    for (i = 0; i < ui->job_count; ++i) {
+        if (ui->jobs[i].state == JOB_RUNNING) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void queue_totals(
+    const UiState *ui,
+    size_t *out_jobs,
+    size_t *out_files,
+    unsigned long long *out_bytes,
+    size_t *out_running,
+    size_t *out_pending
+) {
+    size_t i;
+    size_t jobs = 0;
+    size_t files = 0;
+    unsigned long long bytes = 0;
+    size_t running = 0;
+    size_t pending = 0;
+
+    for (i = 0; i < ui->job_count; ++i) {
+        ++jobs;
+        files += ui->jobs[i].file_count;
+        bytes += ui->jobs[i].byte_count;
+        if (ui->jobs[i].state == JOB_RUNNING) {
+            ++running;
+        } else {
+            ++pending;
+        }
+    }
+
+    *out_jobs = jobs;
+    *out_files = files;
+    *out_bytes = bytes;
+    *out_running = running;
+    *out_pending = pending;
+}
+
+static int summarize_path_recursive(
+    const char *path,
+    size_t *out_files,
+    unsigned long long *out_bytes,
+    char *err,
+    size_t err_size
+) {
+    struct stat st;
+
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            *out_files = 0;
+            *out_bytes = 0;
+            return 0;
+        }
+        snprintf(err, err_size, "Cannot inspect '%s': %s", path, strerror(errno));
+        return -1;
+    }
+
+    if (S_ISREG(st.st_mode)) {
+        *out_files = 1;
+        *out_bytes = (unsigned long long)st.st_size;
+        return 0;
+    }
+
+    if (!S_ISDIR(st.st_mode)) {
+        *out_files = 0;
+        *out_bytes = 0;
+        return 0;
+    }
+
+    DIR *dir = opendir(path);
+    struct dirent *entry;
+    size_t files = 0;
+    unsigned long long bytes = 0;
+    int saved_errno = 0;
+
+    if (dir == NULL) {
+        snprintf(err, err_size, "Cannot open '%s': %s", path, strerror(errno));
+        return -1;
+    }
+
+    errno = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        char *child_path;
+        size_t child_files = 0;
+        unsigned long long child_bytes = 0;
+
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        child_path = path_join(path, entry->d_name);
+        if (child_path == NULL) {
+            closedir(dir);
+            snprintf(err, err_size, "Out of memory while scanning '%s'", path);
+            return -1;
+        }
+
+        if (summarize_path_recursive(child_path, &child_files, &child_bytes, err, err_size) != 0) {
+            free(child_path);
+            closedir(dir);
+            return -1;
+        }
+
+        free(child_path);
+        files += child_files;
+        bytes += child_bytes;
+    }
+
+    saved_errno = errno;
+    closedir(dir);
+    if (saved_errno != 0) {
+        snprintf(err, err_size, "Cannot read '%s': %s", path, strerror(saved_errno));
+        return -1;
+    }
+
+    *out_files = files;
+    *out_bytes = bytes;
+    return 0;
+}
+
+static int summarize_job_workload(
+    UiState *ui,
+    const Node *node,
+    JobAction action,
+    size_t *out_files,
+    unsigned long long *out_bytes
+) {
+    char *path;
+    char err[512];
+    int rc;
+
+    path = path_join(action == JOB_COPY ? ui->source_root : ui->target_root, node->relative_path);
+    if (path == NULL) {
+        set_status(ui, "Out of memory while preparing the queue entry.");
+        return -1;
+    }
+
+    err[0] = '\0';
+    rc = summarize_path_recursive(path, out_files, out_bytes, err, sizeof(err));
+    free(path);
+    if (rc != 0) {
+        set_status(ui, "%s", err[0] != '\0' ? err : "Failed to inspect the queued workload.");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int append_job(UiState *ui, TransferJob *job) {
+    TransferJob *grown;
+
+    if (ui->job_count == ui->job_capacity) {
+        size_t next_capacity = ui->job_capacity == 0 ? 8 : ui->job_capacity * 2;
+        grown = realloc(ui->jobs, next_capacity * sizeof(*ui->jobs));
+        if (grown == NULL) {
+            return -1;
+        }
+        ui->jobs = grown;
+        ui->job_capacity = next_capacity;
+    }
+
+    ui->jobs[ui->job_count] = *job;
+    ++ui->job_count;
+    return 0;
+}
+
+static bool set_close_on_exec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+
+    if (flags < 0) {
+        return false;
+    }
+
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+static bool job_overlaps_path(const TransferJob *job, const char *relative_path) {
+    return paths_overlap(job->relative_path, relative_path);
+}
+
+static const TransferJob *find_overlapping_job(const UiState *ui, const char *relative_path) {
+    size_t i;
+
+    for (i = 0; i < ui->job_count; ++i) {
+        if (job_overlaps_path(&ui->jobs[i], relative_path)) {
+            return &ui->jobs[i];
+        }
+    }
+
+    return NULL;
+}
+
+static bool node_has_pending_job(const UiState *ui, const Node *node) {
+    if (node == NULL || node->origin != ORIGIN_SOURCE) {
+        return false;
+    }
+
+    return find_overlapping_job(ui, node->relative_path) != NULL;
+}
+
+static int read_fd_message(int fd, char *buffer, size_t buffer_size) {
+    size_t used = 0;
+
+    if (buffer_size == 0) {
+        return -1;
+    }
+
+    while (used + 1 < buffer_size) {
+        ssize_t bytes_read = read(fd, buffer + used, buffer_size - used - 1);
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+        used += (size_t)bytes_read;
+    }
+
+    buffer[used] = '\0';
+    return 0;
+}
+
+static void write_child_message(int fd, const char *message) {
+    size_t len = strlen(message);
+    size_t used = 0;
+
+    while (used < len) {
+        ssize_t bytes_written = write(fd, message + used, len - used);
+        if (bytes_written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        used += (size_t)bytes_written;
+    }
+}
+
+static void run_transfer_child(UiState *ui, const Node *node, JobAction action, int result_fd) {
+    char message[512];
+    char err[512];
+    int rc;
+
+    err[0] = '\0';
+    if (action == JOB_COPY) {
+        rc = copy_source_node_to_target(ui->source_root, ui->target_root, node, err, sizeof(err));
+        if (rc == 0) {
+            snprintf(
+                message,
+                sizeof(message),
+                "Copied '%s' to the target.",
+                node->relative_path[0] != '\0' ? node->relative_path : "."
+            );
+        }
+    } else {
+        rc = remove_target_for_source_node(ui->target_root, node, err, sizeof(err));
+        if (rc == 0) {
+            snprintf(
+                message,
+                sizeof(message),
+                "Removed '%s' from the target.",
+                node->relative_path[0] != '\0' ? node->relative_path : "."
+            );
+        }
+    }
+
+    if (rc != 0) {
+        snprintf(
+            message,
+            sizeof(message),
+            "%s",
+            err[0] != '\0' ? err : (action == JOB_COPY ? "Failed to copy the source item." : "Failed to remove the target item.")
+        );
+    }
+
+    write_child_message(result_fd, message);
+    close(result_fd);
+    _exit(rc == 0 ? 0 : 1);
+}
+
+static int remove_job_at(UiState *ui, size_t index) {
+    if (index >= ui->job_count) {
+        return -1;
+    }
+
+    free_job(&ui->jobs[index]);
+    if (index + 1 < ui->job_count) {
+        memmove(&ui->jobs[index], &ui->jobs[index + 1], (ui->job_count - index - 1) * sizeof(*ui->jobs));
+    }
+    --ui->job_count;
+    return 0;
+}
+
+static int spawn_job_process(UiState *ui, size_t index) {
+    int pipe_fds[2];
+    pid_t pid;
+    Node *node;
+
+    if (index >= ui->job_count) {
+        set_status(ui, "Internal queue error: invalid job index.");
+        return -1;
+    }
+
+    node = tree_find_source_node(ui->tree->root, ui->jobs[index].relative_path);
+    if (node == NULL) {
+        set_status(
+            ui,
+            "Queued %s for '%s' was dropped because the source item no longer exists.",
+            action_label(ui->jobs[index].action),
+            ui->jobs[index].relative_path[0] != '\0' ? ui->jobs[index].relative_path : "."
+        );
+        remove_job_at(ui, index);
+        return 0;
+    }
+
+    if (pipe(pipe_fds) != 0) {
+        set_status(ui, "Cannot create transfer pipe: %s", strerror(errno));
+        return 0;
+    }
+
+    if (!set_close_on_exec(pipe_fds[0]) || !set_close_on_exec(pipe_fds[1])) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        set_status(ui, "Cannot prepare transfer pipe: %s", strerror(errno));
+        return 0;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        set_status(ui, "Cannot start transfer: %s", strerror(errno));
+        return 0;
+    }
+
+    if (pid == 0) {
+        close(pipe_fds[0]);
+        run_transfer_child(ui, node, ui->jobs[index].action, pipe_fds[1]);
+    }
+
+    close(pipe_fds[1]);
+    ui->jobs[index].pid = pid;
+    ui->jobs[index].result_fd = pipe_fds[0];
+    ui->jobs[index].state = JOB_RUNNING;
+
+    set_status(
+        ui,
+        "Started %s for '%s'.",
+        action_label(ui->jobs[index].action),
+        ui->jobs[index].relative_path[0] != '\0' ? ui->jobs[index].relative_path : "."
+    );
+    return 0;
+}
+
+static int start_next_pending_job(UiState *ui) {
+    size_t i;
+
+    if (has_running_job(ui)) {
+        return 0;
+    }
+
+    for (i = 0; i < ui->job_count; ++i) {
+        if (ui->jobs[i].state == JOB_PENDING) {
+            return spawn_job_process(ui, i);
+        }
+    }
+
+    return 0;
+}
+
+static int finish_completed_jobs(UiState *ui, const char *selected_path) {
+    size_t i;
+
+    for (i = 0; i < ui->job_count; ++i) {
+        int status;
+        pid_t rc;
+        char last_message[512] = "";
+
+        if (ui->jobs[i].state != JOB_RUNNING) {
+            continue;
+        }
+
+        rc = waitpid(ui->jobs[i].pid, &status, WNOHANG);
+        if (rc == 0) {
+            return 0;
+        }
+        if (rc < 0) {
+            set_status(ui, "Cannot wait for transfer %ld: %s", (long)ui->jobs[i].pid, strerror(errno));
+            return -1;
+        }
+
+        if (read_fd_message(ui->jobs[i].result_fd, last_message, sizeof(last_message)) != 0) {
+            snprintf(last_message, sizeof(last_message), "Transfer for '%s' finished without a readable result.", ui->jobs[i].relative_path);
+        }
+
+        close(ui->jobs[i].result_fd);
+        ui->jobs[i].result_fd = -1;
+
+        set_status(ui, "%s", last_message[0] != '\0' ? last_message : "Transfer finished.");
+        remove_job_at(ui, i);
+
+        if (reload_tree(ui, selected_path) != 0) {
+            return -1;
+        }
+
+        if (start_next_pending_job(ui) != 0) {
+            return -1;
+        }
+
+        return 1;
+    }
+
+    return start_next_pending_job(ui);
 }
 
 static void string_list_free(StringList *list) {
@@ -229,7 +761,28 @@ static char status_marker(const Node *node) {
     return ' ';
 }
 
-static void format_row(char *buffer, size_t buffer_size, const VisibleRow *row) {
+static char pending_marker(const UiState *ui, const Node *node) {
+    return node_has_pending_job(ui, node) ? '*' : ' ';
+}
+
+static void format_queue_summary(const UiState *ui, char *buffer, size_t buffer_size) {
+    size_t jobs;
+    size_t files;
+    unsigned long long bytes;
+    size_t running;
+    size_t pending;
+
+    queue_totals(ui, &jobs, &files, &bytes, &running, &pending);
+    snprintf(
+        buffer,
+        buffer_size,
+        "Queue: %zu file(s) / %.1f MB",
+        files,
+        (double)bytes / (1024.0 * 1024.0)
+    );
+}
+
+static void format_row(char *buffer, size_t buffer_size, UiState *ui, const VisibleRow *row) {
     const Node *node = row->node;
     int indent = row->depth * 2;
     char expand = node->kind == NODE_DIR ? (node->expanded ? 'v' : '>') : ' ';
@@ -239,10 +792,11 @@ static void format_row(char *buffer, size_t buffer_size, const VisibleRow *row) 
         snprintf(
             buffer,
             buffer_size,
-            "%*s%c [target] %s%s",
+            "%*s%c [target]%c %s%s",
             indent,
             "",
             expand,
+            pending_marker(ui, node),
             node->name,
             suffix
         );
@@ -252,20 +806,44 @@ static void format_row(char *buffer, size_t buffer_size, const VisibleRow *row) 
     snprintf(
         buffer,
         buffer_size,
-        "%*s%c [%c]%c %s%s",
+        "%*s%c [%c]%c%c %s%s",
         indent,
         "",
         expand,
         node->checked ? 'x' : ' ',
         status_marker(node),
+        pending_marker(ui, node),
         node->name,
         suffix
     );
 }
 
-static void render_selected_summary(const Node *node) {
+static void render_selected_summary(const UiState *ui, const Node *node) {
+    const TransferJob *job;
+
     if (node == NULL) {
         mvaddnstr(LINES - 1, 0, "No items in the source directory.", COLS - 1);
+        return;
+    }
+
+    job = find_overlapping_job(ui, node->relative_path);
+    if (job != NULL) {
+        if (job->state == JOB_RUNNING) {
+            mvprintw(
+                LINES - 1,
+                0,
+                "Transfer running for '%s'. Wait for it to finish before changing overlapping paths.",
+                job->relative_path[0] != '\0' ? job->relative_path : "."
+            );
+        } else {
+            mvprintw(
+                LINES - 1,
+                0,
+                "Transfer queued for '%s'. Wait for earlier queued work to clear before changing overlapping paths.",
+                job->relative_path[0] != '\0' ? job->relative_path : "."
+            );
+        }
+        clrtoeol();
         return;
     }
 
@@ -285,7 +863,7 @@ static void render_selected_summary(const Node *node) {
             mvprintw(
                 LINES - 1,
                 0,
-                "%s is fully present on the target. Enter removes it and %zu extra target item(s).",
+                "%s is fully present on the target. Delete removes it and %zu extra target item(s).",
                 node->relative_path[0] != '\0' ? node->relative_path : ".",
                 node->hidden_target_only_count
             );
@@ -293,7 +871,7 @@ static void render_selected_summary(const Node *node) {
             mvprintw(
                 LINES - 1,
                 0,
-                "%s is present on the target. Enter removes it from the target.",
+                "%s is present on the target. Delete removes it from the target.",
                 node->relative_path[0] != '\0' ? node->relative_path : "."
             );
         }
@@ -305,7 +883,7 @@ static void render_selected_summary(const Node *node) {
         mvprintw(
             LINES - 1,
             0,
-            "%s is not fully present. Enter will copy it and delete %zu conflicting target item(s).",
+            "%s is not fully present. Enter queues a copy and deletes %zu conflicting target item(s).",
             node->relative_path[0] != '\0' ? node->relative_path : ".",
             node->replacement_delete_count
         );
@@ -317,7 +895,7 @@ static void render_selected_summary(const Node *node) {
         mvprintw(
             LINES - 1,
             0,
-            "%s is partially present on the target. Enter copies the missing source items.",
+            "%s is partially present on the target. Enter queues the missing source items.",
             node->relative_path[0] != '\0' ? node->relative_path : "."
         );
         clrtoeol();
@@ -327,7 +905,7 @@ static void render_selected_summary(const Node *node) {
     mvprintw(
         LINES - 1,
         0,
-        "%s is missing on the target. Enter copies it to the matching target path.",
+        "%s is missing on the target. Enter queues it for copy to the matching target path.",
         node->relative_path[0] != '\0' ? node->relative_path : "."
     );
     clrtoeol();
@@ -362,6 +940,7 @@ static void draw_popup(const char *title, const char *const *lines, size_t line_
     wrefresh(win);
 
     if (wait_for_key) {
+        wtimeout(win, -1);
         wgetch(win);
     }
 
@@ -381,7 +960,9 @@ static bool confirm_destructive_action(const char *verb, size_t count) {
     lines[2] = "Continue? [y/N]";
 
     draw_popup("Warning", lines, 3, false);
+    timeout(-1);
     ch = getch();
+    timeout(100);
     return ch == 'y' || ch == 'Y';
 }
 
@@ -390,15 +971,17 @@ static void show_help(void) {
         "Up/Down  Move through the visible list",
         "Right    Expand the selected directory",
         "Left     Collapse it, or move to the parent",
-        "Enter    Copy missing source items, or remove synced target items",
+        "Enter    Check the selected source item and queue a copy",
+        "Delete   Uncheck the selected source item and queue removal",
         "a        Show or hide target-only items",
         "r        Reload the source and target directories",
-        "q        Quit",
+        "q        Quit; asks if the queue is not empty",
         "",
         "[x]      Present on target; directories mean the full source subtree exists",
         "[ ]      Missing on target",
         "~        Some of the source subtree is already present on the target",
         "!        Toggling this node deletes or replaces target-only target content",
+        "*        A transfer is queued or running for this item or subtree",
         "[target] Visible only when extras are shown; not interactable",
         "",
         "Press any key to return."
@@ -410,10 +993,29 @@ static void show_help(void) {
 static void render(UiState *ui, VisibleRow *rows, size_t row_count) {
     size_t i;
     int list_top = 3;
-    int list_height = LINES - 4;
+    int list_height = LINES - 5;
+    char status_line[512];
+    char queue_summary[128];
+    char source_line[1024];
+    size_t queue_summary_len;
+    int source_width;
+
+    if (list_height < 0) {
+        list_height = 0;
+    }
 
     erase();
-    mvprintw(0, 0, "Source: %s", ui->source_root);
+    format_queue_summary(ui, queue_summary, sizeof(queue_summary));
+    queue_summary_len = strlen(queue_summary);
+    snprintf(source_line, sizeof(source_line), "Source: %s", ui->source_root);
+    source_width = COLS - (int)queue_summary_len - 1;
+    if (source_width < 0) {
+        source_width = 0;
+    }
+    mvaddnstr(0, 0, source_line, source_width);
+    if ((int)queue_summary_len < COLS) {
+        mvaddnstr(0, COLS - (int)queue_summary_len, queue_summary, (int)queue_summary_len);
+    }
     clrtoeol();
     mvprintw(1, 0, "Target: %s", ui->target_root);
     clrtoeol();
@@ -426,7 +1028,7 @@ static void render(UiState *ui, VisibleRow *rows, size_t row_count) {
         size_t row_index = ui->scroll_offset + i;
         char line[1024];
 
-        format_row(line, sizeof(line), &rows[row_index]);
+        format_row(line, sizeof(line), ui, &rows[row_index]);
 
         if (row_index == ui->selected_index) {
             attron(A_REVERSE);
@@ -444,74 +1046,165 @@ static void render(UiState *ui, VisibleRow *rows, size_t row_count) {
     }
 
     if (ui->status[0] != '\0') {
-        mvaddnstr(LINES - 2, 0, ui->status, COLS - 1);
-        clrtoeol();
-    } else {
-        move(LINES - 2, 0);
-        clrtoeol();
-    }
+        size_t jobs;
+        size_t files;
+        unsigned long long bytes;
+        size_t running;
+        size_t pending;
 
-    render_selected_summary(row_count > 0 ? rows[ui->selected_index].node : NULL);
+        queue_totals(ui, &jobs, &files, &bytes, &running, &pending);
+        snprintf(
+            status_line,
+            sizeof(status_line),
+            "Queue: %zu running, %zu waiting, %zu file(s), %.1f MB | %.420s",
+            running,
+            pending,
+            files,
+            (double)bytes / (1024.0 * 1024.0),
+            ui->status
+        );
+    } else {
+        size_t jobs;
+        size_t files;
+        unsigned long long bytes;
+        size_t running;
+        size_t pending;
+
+        queue_totals(ui, &jobs, &files, &bytes, &running, &pending);
+        snprintf(
+            status_line,
+            sizeof(status_line),
+            "Queue: %zu running, %zu waiting, %zu file(s), %.1f MB",
+            running,
+            pending,
+            files,
+            (double)bytes / (1024.0 * 1024.0)
+        );
+    }
+    mvaddnstr(LINES - 2, 0, status_line, COLS - 1);
+    clrtoeol();
+
+    render_selected_summary(ui, row_count > 0 ? rows[ui->selected_index].node : NULL);
     refresh();
 }
 
-static int toggle_selected_node(UiState *ui, const Node *node) {
-    char err[512];
-    char *selected_path = NULL;
-    int rc;
+static bool confirm_quit_with_queue(size_t count) {
+    char line1[128];
+    const char *lines[3];
+    int ch;
+
+    snprintf(line1, sizeof(line1), "%zu transfer(s) are still queued.", count);
+    lines[0] = line1;
+    lines[1] = "Quit anyway? The active transfer continues, but queued transfers are discarded.";
+    lines[2] = "Continue? [y/N]";
+
+    draw_popup("Quit", lines, 3, false);
+    timeout(-1);
+    ch = getch();
+    timeout(100);
+    return ch == 'y' || ch == 'Y';
+}
+
+static int queue_selected_node(UiState *ui, const Node *node, JobAction action) {
+    const TransferJob *job;
+    TransferJob queued_job;
+    size_t jobs;
+    size_t files;
+    unsigned long long bytes;
+    size_t running;
+    size_t pending;
 
     if (node == NULL || node->origin != ORIGIN_SOURCE) {
         set_status(ui, "Target-only items cannot be changed here.");
         return 0;
     }
 
-    selected_path = dup_string(node->relative_path);
-    if (selected_path == NULL) {
-        set_status(ui, "Out of memory while preparing the operation.");
+    job = find_overlapping_job(ui, node->relative_path);
+    if (job != NULL) {
+        set_status(
+            ui,
+            "Cannot %s '%s' while '%s' is %s for an overlapping path.",
+            action_label(action),
+            node->relative_path[0] != '\0' ? node->relative_path : ".",
+            job->relative_path[0] != '\0' ? job->relative_path : ".",
+            job_state_label(job->state)
+        );
         return 0;
     }
 
-    if (node->checked) {
+    if (action == JOB_REMOVE) {
+        if (!node->checked) {
+            set_status(
+                ui,
+                "'%s' is already unchecked. Use Enter to copy it to the target.",
+                node->relative_path[0] != '\0' ? node->relative_path : "."
+            );
+            return 0;
+        }
+
         if (node->kind == NODE_DIR && node->hidden_target_only_count > 0) {
-            if (!confirm_destructive_action("Unchecking", node->hidden_target_only_count)) {
+            if (!confirm_destructive_action("Deleting", node->hidden_target_only_count)) {
                 set_status(ui, "Operation cancelled.");
-                free(selected_path);
                 return 0;
             }
         }
-
-        err[0] = '\0';
-        rc = remove_target_for_source_node(ui->target_root, node, err, sizeof(err));
-        if (rc != 0) {
-            set_status(ui, "%s", err[0] != '\0' ? err : "Failed to remove the target item.");
-            free(selected_path);
-            return 0;
-        }
-
-        set_status(ui, "Removed '%s' from the target.", node->relative_path[0] != '\0' ? node->relative_path : ".");
-    } else {
-        if (node->replacement_delete_count > 0) {
-            if (!confirm_destructive_action("Checking", node->replacement_delete_count)) {
-                set_status(ui, "Operation cancelled.");
-                free(selected_path);
-                return 0;
-            }
-        }
-
-        err[0] = '\0';
-        rc = copy_source_node_to_target(ui->source_root, ui->target_root, node, err, sizeof(err));
-        if (rc != 0) {
-            set_status(ui, "%s", err[0] != '\0' ? err : "Failed to copy the source item.");
-            free(selected_path);
-            return 0;
-        }
-
-        set_status(ui, "Copied '%s' to the target.", node->relative_path[0] != '\0' ? node->relative_path : ".");
     }
 
-    rc = reload_tree(ui, selected_path);
-    free(selected_path);
-    return rc;
+    if (action == JOB_COPY && node->checked) {
+        set_status(
+            ui,
+            "'%s' is already checked. Use Delete to remove it from the target.",
+            node->relative_path[0] != '\0' ? node->relative_path : "."
+        );
+        return 0;
+    }
+
+    if (action == JOB_COPY && node->replacement_delete_count > 0) {
+        if (!confirm_destructive_action("Copying", node->replacement_delete_count)) {
+            set_status(ui, "Operation cancelled.");
+            return 0;
+        }
+    }
+
+    queued_job.pid = -1;
+    queued_job.result_fd = -1;
+    queued_job.relative_path = dup_string(node->relative_path);
+    queued_job.action = action;
+    queued_job.state = JOB_PENDING;
+    queued_job.file_count = 0;
+    queued_job.byte_count = 0;
+
+    if (queued_job.relative_path == NULL) {
+        set_status(ui, "Out of memory while queueing the transfer.");
+        return 0;
+    }
+
+    if (summarize_job_workload(ui, node, action, &queued_job.file_count, &queued_job.byte_count) != 0) {
+        free(queued_job.relative_path);
+        return 0;
+    }
+
+    if (append_job(ui, &queued_job) != 0) {
+        free(queued_job.relative_path);
+        set_status(ui, "Out of memory while queueing the transfer.");
+        return 0;
+    }
+
+    if (start_next_pending_job(ui) != 0) {
+        return 0;
+    }
+
+    queue_totals(ui, &jobs, &files, &bytes, &running, &pending);
+    set_status(
+        ui,
+        "%s '%s'. Queue: %zu job(s), %zu file(s), %.1f MB.",
+        running > 0 && pending + running == 1 ? "Started" : "Queued",
+        node->relative_path[0] != '\0' ? node->relative_path : ".",
+        jobs,
+        files,
+        (double)bytes / (1024.0 * 1024.0)
+    );
+    return 0;
 }
 
 int ui_run(const char *source_root, const char *target_root) {
@@ -538,11 +1231,39 @@ int ui_run(const char *source_root, const char *target_root) {
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
+    timeout(100);
 
     while (true) {
         VisibleRow *rows = NULL;
         size_t row_count = tree_collect_visible(ui.tree->root, ui.show_target_only, &rows);
+        char *selected_path = NULL;
         int ch;
+        const Node *selected_node = NULL;
+
+        if (row_count > 0 && ui.selected_index >= row_count) {
+            ui.selected_index = row_count - 1;
+        }
+        if (row_count > 0) {
+            selected_node = rows[ui.selected_index].node;
+            if (selected_node->origin == ORIGIN_SOURCE) {
+                selected_path = dup_string(selected_node->relative_path);
+            }
+        }
+
+        rc = finish_completed_jobs(&ui, selected_path);
+        free(selected_path);
+        if (rc < 0) {
+            free(rows);
+            endwin();
+            fprintf(stderr, "%s\n", ui.status);
+            free_jobs(&ui);
+            tree_free(ui.tree);
+            return 1;
+        }
+        if (rc > 0) {
+            free(rows);
+            continue;
+        }
 
         if (row_count == 0) {
             ui.selected_index = 0;
@@ -554,7 +1275,17 @@ int ui_run(const char *source_root, const char *target_root) {
         render(&ui, rows, row_count);
         ch = getch();
 
+        if (ch == ERR) {
+            free(rows);
+            continue;
+        }
+
         if (ch == 'q' || ch == 'Q') {
+            if (ui.job_count > 0 && !confirm_quit_with_queue(ui.job_count)) {
+                set_status(&ui, "Quit cancelled.");
+                free(rows);
+                continue;
+            }
             free(rows);
             break;
         }
@@ -575,6 +1306,7 @@ int ui_run(const char *source_root, const char *target_root) {
             if (rc != 0) {
                 endwin();
                 fprintf(stderr, "%s\n", ui.status);
+                free_jobs(&ui);
                 tree_free(ui.tree);
                 return 1;
             }
@@ -646,15 +1378,15 @@ int ui_run(const char *source_root, const char *target_root) {
 
             case '\n':
             case KEY_ENTER:
-            case ' ':
-                rc = toggle_selected_node(&ui, rows[ui.selected_index].node);
+                rc = queue_selected_node(&ui, rows[ui.selected_index].node, JOB_COPY);
                 free(rows);
-                if (rc != 0) {
-                    endwin();
-                    fprintf(stderr, "%s\n", ui.status);
-                    tree_free(ui.tree);
-                    return 1;
-                }
+                (void)rc;
+                continue;
+
+            case KEY_DC:
+                rc = queue_selected_node(&ui, rows[ui.selected_index].node, JOB_REMOVE);
+                free(rows);
+                (void)rc;
                 continue;
 
             default:
@@ -665,6 +1397,7 @@ int ui_run(const char *source_root, const char *target_root) {
     }
 
     endwin();
+    free_jobs(&ui);
     tree_free(ui.tree);
     return 0;
 }
