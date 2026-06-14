@@ -1,3 +1,6 @@
+/* SPDX-FileCopyrightText: 2026 Lambdara */
+/* SPDX-License-Identifier: GPL-3.0-only */
+
 #include "subsync.h"
 
 #include <locale.h>
