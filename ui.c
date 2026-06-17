@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef enum {
@@ -35,6 +36,15 @@ typedef struct {
     JobState state;
     size_t file_count;
     unsigned long long byte_count;
+    size_t files_completed;
+    unsigned long long bytes_completed;
+    unsigned long long current_file_bytes;
+    unsigned long long current_file_total;
+    bool has_progress;
+    char current_path[512];
+    char final_message[512];
+    char read_buffer[2048];
+    size_t read_buffer_used;
 } TransferJob;
 
 typedef struct {
@@ -55,6 +65,15 @@ typedef struct {
     size_t count;
     size_t capacity;
 } StringList;
+
+typedef struct {
+    const char *title;
+    const char *source_root;
+    const char *target_root;
+    TreeBuildProgress progress;
+    char current_path[512];
+    double last_render_at;
+} LoadingState;
 
 static int reload_tree(UiState *ui, const char *selected_path);
 
@@ -100,6 +119,65 @@ static char *path_join(const char *base, const char *relative_path) {
     return joined;
 }
 
+static double monotonic_seconds(void) {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static bool set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+
+    if (flags < 0) {
+        return false;
+    }
+
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+static void sanitize_display_text(char *buffer, size_t buffer_size, const char *value) {
+    size_t used = 0;
+
+    if (buffer_size == 0) {
+        return;
+    }
+
+    if (value == NULL) {
+        buffer[0] = '\0';
+        return;
+    }
+
+    while (*value != '\0' && used + 1 < buffer_size) {
+        unsigned char ch = (unsigned char)*value++;
+
+        if (ch == '\n' || ch == '\r' || ch == '\t') {
+            buffer[used++] = ' ';
+        } else if (ch >= 0x20) {
+            buffer[used++] = (char)ch;
+        }
+    }
+
+    buffer[used] = '\0';
+}
+
+static void format_size(unsigned long long bytes, char *buffer, size_t buffer_size) {
+    static const char *const units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double value = (double)bytes;
+    size_t unit_index = 0;
+
+    while (value >= 1024.0 && unit_index + 1 < sizeof(units) / sizeof(units[0])) {
+        value /= 1024.0;
+        ++unit_index;
+    }
+
+    if (unit_index == 0) {
+        snprintf(buffer, buffer_size, "%llu %s", bytes, units[unit_index]);
+    } else {
+        snprintf(buffer, buffer_size, "%.1f %s", value, units[unit_index]);
+    }
+}
+
 static bool path_is_same_or_nested(const char *left, const char *right) {
     size_t left_len;
 
@@ -129,6 +207,18 @@ static const char *action_label(JobAction action) {
 
 static const char *job_state_label(JobState state) {
     return state == JOB_RUNNING ? "running" : "queued";
+}
+
+static const TransferJob *find_running_job_const(const UiState *ui) {
+    size_t i;
+
+    for (i = 0; i < ui->job_count; ++i) {
+        if (ui->jobs[i].state == JOB_RUNNING) {
+            return &ui->jobs[i];
+        }
+    }
+
+    return NULL;
 }
 
 static void free_job(TransferJob *job) {
@@ -288,9 +378,63 @@ static int summarize_job_workload(
     size_t *out_files,
     unsigned long long *out_bytes
 ) {
-    char *path;
+    char *path = NULL;
     char err[512];
-    int rc;
+    int rc = 0;
+
+    *out_files = 0;
+    *out_bytes = 0;
+
+    if (action == JOB_COPY) {
+        struct stat st;
+        size_t i;
+
+        if (node == NULL || node->origin != ORIGIN_SOURCE) {
+            set_status(ui, "No source item is selected.");
+            return -1;
+        }
+
+        if (node->kind == NODE_FILE) {
+            if (node->target_match) {
+                return 0;
+            }
+
+            path = path_join(ui->source_root, node->relative_path);
+            if (path == NULL) {
+                set_status(ui, "Out of memory while preparing the queue entry.");
+                return -1;
+            }
+
+            if (lstat(path, &st) != 0) {
+                set_status(ui, "Cannot inspect '%s': %s", path, strerror(errno));
+                free(path);
+                return -1;
+            }
+
+            free(path);
+            *out_files = 1;
+            *out_bytes = (unsigned long long)st.st_size;
+            return 0;
+        }
+
+        for (i = 0; i < node->child_count; ++i) {
+            size_t child_files = 0;
+            unsigned long long child_bytes = 0;
+
+            if (node->children[i]->origin != ORIGIN_SOURCE) {
+                continue;
+            }
+
+            if (summarize_job_workload(ui, node->children[i], action, &child_files, &child_bytes) != 0) {
+                return -1;
+            }
+
+            *out_files += child_files;
+            *out_bytes += child_bytes;
+        }
+
+        return 0;
+    }
 
     path = path_join(action == JOB_COPY ? ui->source_root : ui->target_root, node->relative_path);
     if (path == NULL) {
@@ -361,30 +505,15 @@ static bool node_has_pending_job(const UiState *ui, const Node *node) {
     return find_overlapping_job(ui, node->relative_path) != NULL;
 }
 
-static int read_fd_message(int fd, char *buffer, size_t buffer_size) {
-    size_t used = 0;
-
-    if (buffer_size == 0) {
-        return -1;
-    }
-
-    while (used + 1 < buffer_size) {
-        ssize_t bytes_read = read(fd, buffer + used, buffer_size - used - 1);
-        if (bytes_read < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        if (bytes_read == 0) {
-            break;
-        }
-        used += (size_t)bytes_read;
-    }
-
-    buffer[used] = '\0';
-    return 0;
-}
+typedef struct {
+    int fd;
+    double last_emit_at;
+    size_t last_files_completed;
+    unsigned long long last_bytes_completed;
+    unsigned long long last_current_file_bytes;
+    unsigned long long last_current_file_total;
+    char last_path[512];
+} ChildProgressReporter;
 
 static void write_child_message(int fd, const char *message) {
     size_t len = strlen(message);
@@ -402,14 +531,84 @@ static void write_child_message(int fd, const char *message) {
     }
 }
 
+static void write_child_protocol_line(int fd, char type, const char *payload) {
+    char line[1024];
+
+    snprintf(line, sizeof(line), "%c\t%s\n", type, payload != NULL ? payload : "");
+    write_child_message(fd, line);
+}
+
+static void report_child_progress(const TransferProgress *progress, void *userdata) {
+    ChildProgressReporter *reporter = userdata;
+    char path[512];
+    char payload[1024];
+    double now = monotonic_seconds();
+    bool path_changed;
+    bool must_emit;
+
+    if (reporter == NULL) {
+        return;
+    }
+
+    sanitize_display_text(path, sizeof(path), progress->current_path != NULL ? progress->current_path : "");
+    path_changed = strcmp(path, reporter->last_path) != 0;
+    must_emit = path_changed ||
+                progress->files_completed != reporter->last_files_completed ||
+                progress->current_file_total != reporter->last_current_file_total ||
+                progress->current_file_bytes >= progress->current_file_total ||
+                progress->bytes_completed != reporter->last_bytes_completed ||
+                now - reporter->last_emit_at >= 0.05;
+
+    if (!must_emit) {
+        return;
+    }
+
+    snprintf(
+        payload,
+        sizeof(payload),
+        "%zu\t%llu\t%llu\t%llu\t%s",
+        progress->files_completed,
+        progress->bytes_completed,
+        progress->current_file_bytes,
+        progress->current_file_total,
+        path
+    );
+    write_child_protocol_line(reporter->fd, 'P', payload);
+
+    reporter->last_emit_at = now;
+    reporter->last_files_completed = progress->files_completed;
+    reporter->last_bytes_completed = progress->bytes_completed;
+    reporter->last_current_file_bytes = progress->current_file_bytes;
+    reporter->last_current_file_total = progress->current_file_total;
+    snprintf(reporter->last_path, sizeof(reporter->last_path), "%s", path);
+}
+
 static void run_transfer_child(UiState *ui, const Node *node, JobAction action, int result_fd) {
     char message[512];
+    char final_payload[512];
     char err[512];
     int rc;
+    ChildProgressReporter reporter = {
+        .fd = result_fd,
+        .last_emit_at = 0.0,
+        .last_files_completed = 0,
+        .last_bytes_completed = 0,
+        .last_current_file_bytes = 0,
+        .last_current_file_total = 0,
+        .last_path = ""
+    };
 
     err[0] = '\0';
     if (action == JOB_COPY) {
-        rc = copy_source_node_to_target(ui->source_root, ui->target_root, node, err, sizeof(err));
+        rc = copy_source_node_to_target(
+            ui->source_root,
+            ui->target_root,
+            node,
+            err,
+            sizeof(err),
+            report_child_progress,
+            &reporter
+        );
         if (rc == 0) {
             snprintf(
                 message,
@@ -419,7 +618,7 @@ static void run_transfer_child(UiState *ui, const Node *node, JobAction action, 
             );
         }
     } else {
-        rc = remove_target_for_source_node(ui->target_root, node, err, sizeof(err));
+        rc = remove_target_for_source_node(ui->target_root, node, err, sizeof(err), NULL, NULL);
         if (rc == 0) {
             snprintf(
                 message,
@@ -439,7 +638,8 @@ static void run_transfer_child(UiState *ui, const Node *node, JobAction action, 
         );
     }
 
-    write_child_message(result_fd, message);
+    sanitize_display_text(final_payload, sizeof(final_payload), message);
+    write_child_protocol_line(result_fd, 'D', final_payload);
     close(result_fd);
     _exit(rc == 0 ? 0 : 1);
 }
@@ -484,7 +684,7 @@ static int spawn_job_process(UiState *ui, size_t index) {
         return 0;
     }
 
-    if (!set_close_on_exec(pipe_fds[0]) || !set_close_on_exec(pipe_fds[1])) {
+    if (!set_close_on_exec(pipe_fds[0]) || !set_close_on_exec(pipe_fds[1]) || !set_nonblocking(pipe_fds[0])) {
         close(pipe_fds[0]);
         close(pipe_fds[1]);
         set_status(ui, "Cannot prepare transfer pipe: %s", strerror(errno));
@@ -508,6 +708,14 @@ static int spawn_job_process(UiState *ui, size_t index) {
     ui->jobs[index].pid = pid;
     ui->jobs[index].result_fd = pipe_fds[0];
     ui->jobs[index].state = JOB_RUNNING;
+    ui->jobs[index].files_completed = 0;
+    ui->jobs[index].bytes_completed = 0;
+    ui->jobs[index].current_file_bytes = 0;
+    ui->jobs[index].current_file_total = 0;
+    ui->jobs[index].has_progress = false;
+    ui->jobs[index].current_path[0] = '\0';
+    ui->jobs[index].final_message[0] = '\0';
+    ui->jobs[index].read_buffer_used = 0;
 
     set_status(
         ui,
@@ -534,13 +742,131 @@ static int start_next_pending_job(UiState *ui) {
     return 0;
 }
 
+static char *next_protocol_field(char **cursor) {
+    char *field = *cursor;
+    char *tab;
+
+    if (field == NULL) {
+        return NULL;
+    }
+
+    tab = strchr(field, '\t');
+    if (tab != NULL) {
+        *tab = '\0';
+        *cursor = tab + 1;
+    } else {
+        *cursor = NULL;
+    }
+
+    return field;
+}
+
+static void handle_job_protocol_line(TransferJob *job, char *line) {
+    if (line[0] == 'P' && line[1] == '\t') {
+        char *cursor = line + 2;
+        char *files_text;
+        char *bytes_text;
+        char *current_bytes_text;
+        char *current_total_text;
+        char *path_text;
+
+        files_text = next_protocol_field(&cursor);
+        bytes_text = next_protocol_field(&cursor);
+        current_bytes_text = next_protocol_field(&cursor);
+        current_total_text = next_protocol_field(&cursor);
+        path_text = cursor != NULL ? cursor : "";
+        if (files_text == NULL || bytes_text == NULL || current_bytes_text == NULL || current_total_text == NULL) {
+            return;
+        }
+
+        job->files_completed = (size_t)strtoull(files_text, NULL, 10);
+        job->bytes_completed = strtoull(bytes_text, NULL, 10);
+        job->current_file_bytes = strtoull(current_bytes_text, NULL, 10);
+        job->current_file_total = strtoull(current_total_text, NULL, 10);
+        sanitize_display_text(job->current_path, sizeof(job->current_path), path_text);
+        job->has_progress = true;
+        return;
+    }
+
+    if (line[0] == 'D' && line[1] == '\t') {
+        sanitize_display_text(job->final_message, sizeof(job->final_message), line + 2);
+    }
+}
+
+static void flush_job_read_buffer(TransferJob *job) {
+    if (job->read_buffer_used == 0) {
+        return;
+    }
+
+    job->read_buffer[job->read_buffer_used] = '\0';
+    handle_job_protocol_line(job, job->read_buffer);
+    job->read_buffer_used = 0;
+}
+
+static int poll_job_updates(UiState *ui, TransferJob *job) {
+    char chunk[512];
+
+    for (;;) {
+        ssize_t bytes_read = read(job->result_fd, chunk, sizeof(chunk));
+
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;
+            }
+            set_status(ui, "Cannot read transfer updates for '%s': %s", job->relative_path, strerror(errno));
+            return -1;
+        }
+
+        if (bytes_read == 0) {
+            return 0;
+        }
+
+        if (job->read_buffer_used + (size_t)bytes_read >= sizeof(job->read_buffer)) {
+            job->read_buffer_used = 0;
+        }
+
+        memcpy(job->read_buffer + job->read_buffer_used, chunk, (size_t)bytes_read);
+        job->read_buffer_used += (size_t)bytes_read;
+
+        for (;;) {
+            char *newline = memchr(job->read_buffer, '\n', job->read_buffer_used);
+            size_t line_len;
+
+            if (newline == NULL) {
+                break;
+            }
+
+            line_len = (size_t)(newline - job->read_buffer);
+            job->read_buffer[line_len] = '\0';
+            handle_job_protocol_line(job, job->read_buffer);
+
+            job->read_buffer_used -= line_len + 1;
+            if (job->read_buffer_used > 0) {
+                memmove(job->read_buffer, newline + 1, job->read_buffer_used);
+            }
+        }
+    }
+}
+
 static int finish_completed_jobs(UiState *ui, const char *selected_path) {
     size_t i;
 
     for (i = 0; i < ui->job_count; ++i) {
+        if (ui->jobs[i].state != JOB_RUNNING || ui->jobs[i].result_fd < 0) {
+            continue;
+        }
+
+        if (poll_job_updates(ui, &ui->jobs[i]) != 0) {
+            return -1;
+        }
+    }
+
+    for (i = 0; i < ui->job_count; ++i) {
         int status;
         pid_t rc;
-        char last_message[512] = "";
 
         if (ui->jobs[i].state != JOB_RUNNING) {
             continue;
@@ -555,14 +881,23 @@ static int finish_completed_jobs(UiState *ui, const char *selected_path) {
             return -1;
         }
 
-        if (read_fd_message(ui->jobs[i].result_fd, last_message, sizeof(last_message)) != 0) {
-            snprintf(last_message, sizeof(last_message), "Transfer for '%s' finished without a readable result.", ui->jobs[i].relative_path);
+        if (ui->jobs[i].result_fd >= 0) {
+            if (poll_job_updates(ui, &ui->jobs[i]) != 0) {
+                return -1;
+            }
+            flush_job_read_buffer(&ui->jobs[i]);
         }
 
         close(ui->jobs[i].result_fd);
         ui->jobs[i].result_fd = -1;
 
-        set_status(ui, "%s", last_message[0] != '\0' ? last_message : "Transfer finished.");
+        set_status(
+            ui,
+            "%s",
+            ui->jobs[i].final_message[0] != '\0'
+                ? ui->jobs[i].final_message
+                : "Transfer finished."
+        );
         remove_job_at(ui, i);
 
         if (reload_tree(ui, selected_path) != 0) {
@@ -673,17 +1008,185 @@ static size_t find_index_for_path(VisibleRow *rows, size_t count, const char *re
     return 0;
 }
 
+static void render_loading_screen(const LoadingState *loading) {
+    char counts_line[256];
+    char phase_line[256];
+    int bar_width = COLS - 4;
+    int bar_row = LINES / 2;
+    int title_row = bar_row - 4;
+    int source_row = bar_row - 2;
+    int target_row = bar_row - 1;
+    int phase_row = bar_row + 2;
+    int counts_row = bar_row + 3;
+    int current_row = bar_row + 5;
+    double directory_ratio = 0.0;
+    int base_fill;
+    int pulse_width;
+    int pulse_cycle;
+    int pulse_offset;
+    int i;
+
+    if (bar_width > COLS - 2) {
+        bar_width = COLS - 2;
+    }
+    if (bar_width < 1) {
+        bar_width = 1;
+    }
+
+    if (title_row < 0) {
+        title_row = 0;
+    }
+    if (source_row < 0) {
+        source_row = 0;
+    }
+    if (target_row < 0) {
+        target_row = 0;
+    }
+    if (phase_row >= LINES) {
+        phase_row = LINES - 1;
+    }
+    if (counts_row >= LINES) {
+        counts_row = LINES - 1;
+    }
+    if (current_row >= LINES) {
+        current_row = LINES - 1;
+    }
+
+    if (loading->progress.directories_discovered > 0) {
+        directory_ratio =
+            (double)loading->progress.directories_completed / (double)loading->progress.directories_discovered;
+    }
+    if (directory_ratio > 1.0) {
+        directory_ratio = 1.0;
+    }
+
+    base_fill = (int)(directory_ratio * (double)bar_width);
+    if (base_fill > bar_width) {
+        base_fill = bar_width;
+    }
+
+    pulse_width = bar_width / 6;
+    if (pulse_width < 3) {
+        pulse_width = 3;
+    }
+    if (pulse_width > 8) {
+        pulse_width = 8;
+    }
+
+    pulse_cycle = bar_width + pulse_width;
+    pulse_offset = (int)(
+        (loading->progress.source_entries_scanned +
+         loading->progress.target_entries_scanned +
+         loading->progress.nodes_created) %
+        (size_t)pulse_cycle
+    ) - pulse_width;
+
+    erase();
+    mvprintw(title_row, 0, "%s", loading->title);
+    clrtoeol();
+    mvprintw(source_row, 0, "Source: %s", loading->source_root);
+    clrtoeol();
+    mvprintw(target_row, 0, "Target: %s", loading->target_root);
+    clrtoeol();
+
+    move(bar_row, 0);
+    addch('[');
+    for (i = 0; i < bar_width; ++i) {
+        bool in_pulse = i >= pulse_offset && i < pulse_offset + pulse_width;
+        char ch = i < base_fill ? '#' : '-';
+
+        if (i >= base_fill && in_pulse) {
+            ch = '=';
+        }
+        addch(ch);
+    }
+    addch(']');
+    clrtoeol();
+
+    if (loading->progress.directories_discovered == 0) {
+        snprintf(
+            phase_line,
+            sizeof(phase_line),
+            "%s  starting...",
+            loading->progress.phase == TREE_PROGRESS_TARGET ? "Scanning target" : "Scanning source"
+        );
+    } else {
+        snprintf(
+            phase_line,
+            sizeof(phase_line),
+            "%s  %zu/%zu directories",
+            loading->progress.phase == TREE_PROGRESS_TARGET ? "Scanning target" : "Scanning source",
+            loading->progress.directories_completed,
+            loading->progress.directories_discovered
+        );
+    }
+    mvaddnstr(phase_row, 0, phase_line, COLS - 1);
+    clrtoeol();
+
+    snprintf(
+        counts_line,
+        sizeof(counts_line),
+        "%zu source entries  |  %zu target entries  |  %zu nodes",
+        loading->progress.source_entries_scanned,
+        loading->progress.target_entries_scanned,
+        loading->progress.nodes_created
+    );
+    mvaddnstr(counts_row, 0, counts_line, COLS - 1);
+    clrtoeol();
+
+    mvprintw(current_row, 0, "Current: %s", loading->current_path[0] != '\0' ? loading->current_path : "(starting)");
+    clrtoeol();
+    refresh();
+}
+
+static void handle_tree_build_progress(const TreeBuildProgress *progress, void *userdata) {
+    LoadingState *loading = userdata;
+    double now = monotonic_seconds();
+
+    loading->progress = *progress;
+    sanitize_display_text(loading->current_path, sizeof(loading->current_path), progress->current_path);
+
+    if (now - loading->last_render_at < 0.03) {
+        return;
+    }
+
+    render_loading_screen(loading);
+    loading->last_render_at = now;
+}
+
 static int reload_tree(UiState *ui, const char *selected_path) {
     char err[512];
     StringList expanded = {0};
     Tree *next_tree;
+    LoadingState loading = {
+        .title = ui->tree == NULL ? "Loading tree..." : "Reloading tree...",
+        .source_root = ui->source_root,
+        .target_root = ui->target_root,
+        .progress = {
+            .phase = TREE_PROGRESS_SOURCE,
+            .directories_discovered = 1
+        },
+        .current_path = "",
+        .last_render_at = 0.0
+    };
 
     if (ui->tree != NULL) {
         collect_expanded_paths(ui->tree->root, &expanded);
     }
 
+    sanitize_display_text(loading.current_path, sizeof(loading.current_path), ui->source_root);
+    render_loading_screen(&loading);
+    loading.last_render_at = monotonic_seconds();
+
     err[0] = '\0';
-    next_tree = tree_build(ui->source_root, ui->target_root, err, sizeof(err));
+    next_tree = tree_build(
+        ui->source_root,
+        ui->target_root,
+        err,
+        sizeof(err),
+        handle_tree_build_progress,
+        &loading
+    );
     if (next_tree == NULL) {
         string_list_free(&expanded);
         snprintf(ui->status, sizeof(ui->status), "%s", err[0] != '\0' ? err : "Failed to reload the tree");
@@ -765,20 +1268,122 @@ static char pending_marker(const UiState *ui, const Node *node) {
     return node_has_pending_job(ui, node) ? '*' : ' ';
 }
 
+static unsigned long long running_job_overall_bytes(const TransferJob *job) {
+    unsigned long long total = job->bytes_completed;
+
+    if (job->current_path[0] != '\0') {
+        total += job->current_file_bytes;
+    }
+    if (total > job->byte_count) {
+        total = job->byte_count;
+    }
+    return total;
+}
+
+static size_t running_job_visible_files(const TransferJob *job) {
+    size_t total = job->files_completed;
+
+    if (job->current_path[0] != '\0' && total < job->file_count) {
+        ++total;
+    }
+    if (total > job->file_count) {
+        total = job->file_count;
+    }
+    return total;
+}
+
+static void format_running_status(const UiState *ui, const TransferJob *job, char *buffer, size_t buffer_size) {
+    char done_text[32];
+    char total_text[32];
+    size_t waiting = ui->job_count > 0 ? ui->job_count - 1 : 0;
+    unsigned long long overall_bytes = running_job_overall_bytes(job);
+    size_t visible_files = running_job_visible_files(job);
+
+    if (job->has_progress) {
+        if (job->byte_count > 0) {
+            double percent = ((double)overall_bytes * 100.0) / (double)job->byte_count;
+
+            format_size(overall_bytes, done_text, sizeof(done_text));
+            format_size(job->byte_count, total_text, sizeof(total_text));
+            snprintf(
+                buffer,
+                buffer_size,
+                "Running %s: %s | %zu/%zu files | %s / %s | %.0f%% | %zu waiting",
+                action_label(job->action),
+                job->current_path[0] != '\0' ? job->current_path : job->relative_path,
+                visible_files,
+                job->file_count,
+                done_text,
+                total_text,
+                percent,
+                waiting
+            );
+            return;
+        }
+
+        snprintf(
+            buffer,
+            buffer_size,
+            "Running %s: %s | %zu/%zu files | %zu waiting",
+            action_label(job->action),
+            job->current_path[0] != '\0' ? job->current_path : job->relative_path,
+            visible_files,
+            job->file_count,
+            waiting
+        );
+        return;
+    }
+
+    snprintf(
+        buffer,
+        buffer_size,
+        "Running %s: %s | %zu waiting",
+        action_label(job->action),
+        job->relative_path[0] != '\0' ? job->relative_path : ".",
+        waiting
+    );
+}
+
 static void format_queue_summary(const UiState *ui, char *buffer, size_t buffer_size) {
+    const TransferJob *running_job = find_running_job_const(ui);
     size_t jobs;
     size_t files;
     unsigned long long bytes;
     size_t running;
     size_t pending;
+    char done_text[32];
+    char total_text[32];
 
     queue_totals(ui, &jobs, &files, &bytes, &running, &pending);
+    if (running_job != NULL && running_job->has_progress && running_job->byte_count > 0) {
+        unsigned long long overall_bytes = running_job_overall_bytes(running_job);
+        double percent = ((double)overall_bytes * 100.0) / (double)running_job->byte_count;
+
+        format_size(overall_bytes, done_text, sizeof(done_text));
+        format_size(running_job->byte_count, total_text, sizeof(total_text));
+        snprintf(buffer, buffer_size, "%s %s / %s (%.0f%%)", action_label(running_job->action), done_text, total_text, percent);
+        return;
+    }
+
+    if (running_job != NULL && running_job->has_progress && running_job->file_count > 0) {
+        snprintf(
+            buffer,
+            buffer_size,
+            "%s %zu/%zu files",
+            action_label(running_job->action),
+            running_job_visible_files(running_job),
+            running_job->file_count
+        );
+        return;
+    }
+
     snprintf(
         buffer,
         buffer_size,
-        "Queue: %zu file(s) / %.1f MB",
+        "Queue: %zu job(s) / %zu file(s)%s",
+        jobs,
         files,
-        (double)bytes / (1024.0 * 1024.0)
+        pending > 0 ? " queued" : ""
     );
 }
 
@@ -999,6 +1604,7 @@ static void render(UiState *ui, VisibleRow *rows, size_t row_count) {
     char source_line[1024];
     size_t queue_summary_len;
     int source_width;
+    const TransferJob *running_job = find_running_job_const(ui);
 
     if (list_height < 0) {
         list_height = 0;
@@ -1045,7 +1651,9 @@ static void render(UiState *ui, VisibleRow *rows, size_t row_count) {
         clrtoeol();
     }
 
-    if (ui->status[0] != '\0') {
+    if (running_job != NULL) {
+        format_running_status(ui, running_job, status_line, sizeof(status_line));
+    } else if (ui->status[0] != '\0') {
         size_t jobs;
         size_t files;
         unsigned long long bytes;
@@ -1166,13 +1774,12 @@ static int queue_selected_node(UiState *ui, const Node *node, JobAction action) 
         }
     }
 
+    memset(&queued_job, 0, sizeof(queued_job));
     queued_job.pid = -1;
     queued_job.result_fd = -1;
     queued_job.relative_path = dup_string(node->relative_path);
     queued_job.action = action;
     queued_job.state = JOB_PENDING;
-    queued_job.file_count = 0;
-    queued_job.byte_count = 0;
 
     if (queued_job.relative_path == NULL) {
         set_status(ui, "Out of memory while queueing the transfer.");
@@ -1221,17 +1828,18 @@ int ui_run(const char *source_root, const char *target_root) {
 
     setlocale(LC_ALL, "");
 
-    if (reload_tree(&ui, NULL) != 0) {
-        fprintf(stderr, "%s\n", ui.status);
-        return 1;
-    }
-
     initscr();
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
     timeout(100);
+
+    if (reload_tree(&ui, NULL) != 0) {
+        endwin();
+        fprintf(stderr, "%s\n", ui.status);
+        return 1;
+    }
 
     while (true) {
         VisibleRow *rows = NULL;

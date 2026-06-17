@@ -25,6 +25,9 @@ typedef struct {
     size_t skipped_target_entries;
     char *err;
     size_t err_size;
+    TreeBuildProgressFn progress_fn;
+    void *progress_userdata;
+    TreeBuildProgress progress;
 } BuildContext;
 
 static void set_error(BuildContext *ctx, const char *fmt, ...) {
@@ -37,6 +40,16 @@ static void set_error(BuildContext *ctx, const char *fmt, ...) {
     va_start(args, fmt);
     vsnprintf(ctx->err, ctx->err_size, fmt, args);
     va_end(args);
+}
+
+static void report_progress(BuildContext *ctx, TreeBuildPhase phase, const char *current_path) {
+    if (ctx->progress_fn == NULL) {
+        return;
+    }
+
+    ctx->progress.phase = phase;
+    ctx->progress.current_path = current_path;
+    ctx->progress_fn(&ctx->progress, ctx->progress_userdata);
 }
 
 static char *dup_string(const char *value) {
@@ -181,6 +194,9 @@ static int read_directory_entries(
     *out_entries = NULL;
     *out_count = 0;
 
+    ++ctx->progress.directories_discovered;
+    report_progress(ctx, source_side ? TREE_PROGRESS_SOURCE : TREE_PROGRESS_TARGET, path);
+
     dir = opendir(path);
     if (dir == NULL) {
         set_error(ctx, "Cannot open directory '%s': %s", path, strerror(errno));
@@ -215,6 +231,8 @@ static int read_directory_entries(
                 return -1;
             }
             if (!supported) {
+                ++ctx->progress.source_entries_scanned;
+                report_progress(ctx, TREE_PROGRESS_SOURCE, path);
                 ++ctx->skipped_source_entries;
                 free(entry_path);
                 continue;
@@ -235,6 +253,13 @@ static int read_directory_entries(
                 continue;
             }
         }
+
+        if (source_side) {
+            ++ctx->progress.source_entries_scanned;
+        } else {
+            ++ctx->progress.target_entries_scanned;
+        }
+        report_progress(ctx, source_side ? TREE_PROGRESS_SOURCE : TREE_PROGRESS_TARGET, path);
 
         free(entry_path);
 
@@ -269,6 +294,9 @@ static int read_directory_entries(
         free_dir_entries(entries, count);
         return -1;
     }
+
+    ++ctx->progress.directories_completed;
+    report_progress(ctx, source_side ? TREE_PROGRESS_SOURCE : TREE_PROGRESS_TARGET, path);
 
     *out_entries = entries;
     *out_count = count;
@@ -428,6 +456,9 @@ static Node *build_target_only_node(
         return NULL;
     }
 
+    ++ctx->progress.nodes_created;
+    report_progress(ctx, TREE_PROGRESS_TARGET, relative_path[0] != '\0' ? relative_path : ctx->target_root);
+
     if (kind == NODE_DIR) {
         char *target_path = path_join(ctx->target_root, relative_path);
         DirEntry *entries = NULL;
@@ -498,6 +529,9 @@ static Node *build_source_node(
         set_error(ctx, "Out of memory while building the tree");
         return NULL;
     }
+
+    ++ctx->progress.nodes_created;
+    report_progress(ctx, TREE_PROGRESS_SOURCE, relative_path[0] != '\0' ? relative_path : ctx->source_root);
 
     target_path = path_join(ctx->target_root, relative_path);
     if (target_path == NULL) {
@@ -683,14 +717,32 @@ static size_t recompute_node(Node *node) {
     return 0;
 }
 
-Tree *tree_build(const char *source_root, const char *target_root, char *err, size_t err_size) {
+Tree *tree_build(
+    const char *source_root,
+    const char *target_root,
+    char *err,
+    size_t err_size,
+    TreeBuildProgressFn progress_fn,
+    void *progress_userdata
+) {
     BuildContext ctx = {
         .source_root = source_root,
         .target_root = target_root,
         .skipped_source_entries = 0,
         .skipped_target_entries = 0,
         .err = err,
-        .err_size = err_size
+        .err_size = err_size,
+        .progress_fn = progress_fn,
+        .progress_userdata = progress_userdata,
+        .progress = {
+            .phase = TREE_PROGRESS_SOURCE,
+            .current_path = source_root,
+            .directories_discovered = 0,
+            .directories_completed = 0,
+            .source_entries_scanned = 0,
+            .target_entries_scanned = 0,
+            .nodes_created = 0
+        }
     };
     Tree *tree;
     char *root_name;
@@ -698,6 +750,8 @@ Tree *tree_build(const char *source_root, const char *target_root, char *err, si
     if (err != NULL && err_size > 0) {
         err[0] = '\0';
     }
+
+    report_progress(&ctx, TREE_PROGRESS_SOURCE, source_root);
 
     root_name = basename_copy(source_root);
     if (root_name == NULL) {

@@ -49,7 +49,41 @@ typedef struct {
     int depth;
 } VisibleRow;
 
-Tree *tree_build(const char *source_root, const char *target_root, char *err, size_t err_size);
+typedef enum {
+    TREE_PROGRESS_SOURCE,
+    TREE_PROGRESS_TARGET
+} TreeBuildPhase;
+
+typedef struct {
+    TreeBuildPhase phase;
+    const char *current_path;
+    size_t directories_discovered;
+    size_t directories_completed;
+    size_t source_entries_scanned;
+    size_t target_entries_scanned;
+    size_t nodes_created;
+} TreeBuildProgress;
+
+typedef void (*TreeBuildProgressFn)(const TreeBuildProgress *progress, void *userdata);
+
+typedef struct {
+    const char *current_path;
+    size_t files_completed;
+    unsigned long long bytes_completed;
+    unsigned long long current_file_bytes;
+    unsigned long long current_file_total;
+} TransferProgress;
+
+typedef void (*TransferProgressFn)(const TransferProgress *progress, void *userdata);
+
+Tree *tree_build(
+    const char *source_root,
+    const char *target_root,
+    char *err,
+    size_t err_size,
+    TreeBuildProgressFn progress_fn,
+    void *progress_userdata
+);
 void tree_free(Tree *tree);
 Node *tree_find_source_node(Node *root, const char *relative_path);
 size_t tree_collect_visible(Node *root, bool show_target_only, VisibleRow **out_rows);
@@ -60,13 +94,17 @@ int copy_source_node_to_target(
     const char *target_root,
     const Node *node,
     char *err,
-    size_t err_size
+    size_t err_size,
+    TransferProgressFn progress_fn,
+    void *progress_userdata
 );
 int remove_target_for_source_node(
     const char *target_root,
     const Node *node,
     char *err,
-    size_t err_size
+    size_t err_size,
+    TransferProgressFn progress_fn,
+    void *progress_userdata
 );
 
 int ui_run(const char *source_root, const char *target_root);

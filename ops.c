@@ -3,6 +3,7 @@
 
 #include "subsync.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -14,6 +15,13 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+typedef struct {
+    TransferProgressFn fn;
+    void *userdata;
+    size_t files_completed;
+    unsigned long long bytes_completed;
+} TransferContext;
 
 static void set_error(char *err, size_t err_size, const char *fmt, ...) {
     va_list args;
@@ -61,6 +69,36 @@ static char *path_join(const char *base, const char *relative_path) {
     joined[base_len] = '/';
     memcpy(joined + base_len + 1, relative_path, rel_len + 1);
     return joined;
+}
+
+static void report_transfer_progress(
+    TransferContext *ctx,
+    const char *current_path,
+    unsigned long long current_file_bytes,
+    unsigned long long current_file_total
+) {
+    TransferProgress progress;
+
+    if (ctx == NULL || ctx->fn == NULL) {
+        return;
+    }
+
+    progress.current_path = current_path;
+    progress.files_completed = ctx->files_completed;
+    progress.bytes_completed = ctx->bytes_completed;
+    progress.current_file_bytes = current_file_bytes;
+    progress.current_file_total = current_file_total;
+    ctx->fn(&progress, ctx->userdata);
+}
+
+static void finish_transferred_file(TransferContext *ctx, unsigned long long file_size) {
+    if (ctx == NULL) {
+        return;
+    }
+
+    ++ctx->files_completed;
+    ctx->bytes_completed += file_size;
+    report_transfer_progress(ctx, NULL, 0, 0);
 }
 
 static bool env_flag_enabled(const char *name) {
@@ -261,10 +299,263 @@ static int gio_remove_path(const char *path, char *err, size_t err_size) {
     return run_command_capture_stderr(argv, err, err_size);
 }
 
-static int gio_copy_file(const char *source_path, const char *target_path, char *err, size_t err_size) {
-    const char *argv[] = {"gio", "copy", "-T", "--default-permissions", source_path, target_path, NULL};
+static bool is_unit_letter(unsigned char ch) {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+}
 
-    return run_command_capture_stderr(argv, err, err_size);
+static int parse_size_token(const char *text, unsigned long long *out_bytes, const char **out_rest) {
+    char *end = NULL;
+    double value;
+    char unit[16];
+    size_t unit_len = 0;
+    double factor = 1.0;
+
+    value = strtod(text, &end);
+    if (end == text) {
+        return -1;
+    }
+
+    while (*end != '\0' && !is_unit_letter((unsigned char)*end)) {
+        ++end;
+    }
+
+    while (is_unit_letter((unsigned char)*end) && unit_len + 1 < sizeof(unit)) {
+        unit[unit_len++] = *end;
+        ++end;
+    }
+    unit[unit_len] = '\0';
+
+    if (unit_len == 0) {
+        return -1;
+    }
+
+    if (strcmp(unit, "bytes") == 0 || strcmp(unit, "B") == 0) {
+        factor = 1.0;
+    } else if (strcmp(unit, "kB") == 0 || strcmp(unit, "KB") == 0) {
+        factor = 1000.0;
+    } else if (strcmp(unit, "MB") == 0) {
+        factor = 1000.0 * 1000.0;
+    } else if (strcmp(unit, "GB") == 0) {
+        factor = 1000.0 * 1000.0 * 1000.0;
+    } else if (strcmp(unit, "TB") == 0) {
+        factor = 1000.0 * 1000.0 * 1000.0 * 1000.0;
+    } else if (strcmp(unit, "KiB") == 0) {
+        factor = 1024.0;
+    } else if (strcmp(unit, "MiB") == 0) {
+        factor = 1024.0 * 1024.0;
+    } else if (strcmp(unit, "GiB") == 0) {
+        factor = 1024.0 * 1024.0 * 1024.0;
+    } else if (strcmp(unit, "TiB") == 0) {
+        factor = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    } else {
+        return -1;
+    }
+
+    *out_bytes = (unsigned long long)(value * factor + 0.5);
+    if (out_rest != NULL) {
+        *out_rest = end;
+    }
+    return 0;
+}
+
+static void strip_control_sequences(const char *input, char *output, size_t output_size) {
+    size_t used = 0;
+    const unsigned char *cursor = (const unsigned char *)input;
+
+    if (output_size == 0) {
+        return;
+    }
+
+    while (*cursor != '\0' && used + 1 < output_size) {
+        if (*cursor == '\033' && cursor[1] == '[') {
+            cursor += 2;
+            while (*cursor != '\0' && !((*cursor >= '@' && *cursor <= '~'))) {
+                ++cursor;
+            }
+            if (*cursor != '\0') {
+                ++cursor;
+            }
+            continue;
+        }
+
+        if (*cursor >= 0x20 || *cursor == '\t') {
+            output[used++] = (char)*cursor;
+        }
+        ++cursor;
+    }
+
+    output[used] = '\0';
+    trim_trailing_newlines(output);
+}
+
+static int parse_gio_progress_line(const char *line, unsigned long long *out_done, unsigned long long *out_total) {
+    const char *marker;
+    const char *cursor;
+
+    marker = strstr(line, "Transferred ");
+    if (marker == NULL) {
+        return -1;
+    }
+
+    cursor = marker + strlen("Transferred ");
+    if (parse_size_token(cursor, out_done, &cursor) != 0) {
+        return -1;
+    }
+
+    marker = strstr(cursor, "out of");
+    if (marker == NULL) {
+        return -1;
+    }
+
+    cursor = marker + strlen("out of");
+    if (parse_size_token(cursor, out_total, &cursor) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int gio_copy_file(
+    const char *source_path,
+    const char *target_path,
+    const char *relative_path,
+    TransferContext *progress,
+    char *err,
+    size_t err_size
+) {
+    const char *argv[] = {"gio", "copy", "-p", "-T", "--default-permissions", source_path, target_path, NULL};
+    int pipe_fds[2];
+    int devnull_fd = -1;
+    pid_t pid;
+    int status;
+    char line_buffer[512];
+    size_t line_used = 0;
+    char last_output[512] = "";
+    char chunk[256];
+    ssize_t bytes_read;
+
+    if (pipe(pipe_fds) != 0) {
+        set_error(err, err_size, "Cannot create subprocess pipe: %s", strerror(errno));
+        return -1;
+    }
+
+    devnull_fd = open("/dev/null", O_RDONLY);
+    if (devnull_fd < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        set_error(err, err_size, "Cannot open /dev/null: %s", strerror(errno));
+        return -1;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        close(devnull_fd);
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        set_error(err, err_size, "Cannot fork subprocess: %s", strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        setenv("LC_ALL", "C", 1);
+        close(pipe_fds[0]);
+
+        if (dup2(devnull_fd, STDIN_FILENO) < 0) {
+            dprintf(pipe_fds[1], "dup2 failed: %s\n", strerror(errno));
+            _exit(127);
+        }
+        if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) {
+            dprintf(pipe_fds[1], "dup2 failed: %s\n", strerror(errno));
+            _exit(127);
+        }
+        if (dup2(pipe_fds[1], STDERR_FILENO) < 0) {
+            dprintf(pipe_fds[1], "dup2 failed: %s\n", strerror(errno));
+            _exit(127);
+        }
+
+        close(devnull_fd);
+        close(pipe_fds[1]);
+        execvp(argv[0], (char *const *)argv);
+        dprintf(STDERR_FILENO, "Cannot run %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    close(devnull_fd);
+    close(pipe_fds[1]);
+
+    while ((bytes_read = read(pipe_fds[0], chunk, sizeof(chunk))) > 0) {
+        size_t i;
+
+        for (i = 0; i < (size_t)bytes_read; ++i) {
+            unsigned char ch = (unsigned char)chunk[i];
+
+            if (ch == '\r' || ch == '\n') {
+                char cleaned[512];
+                unsigned long long transferred = 0;
+                unsigned long long total = 0;
+
+                line_buffer[line_used] = '\0';
+                strip_control_sequences(line_buffer, cleaned, sizeof(cleaned));
+                if (cleaned[0] != '\0') {
+                    if (parse_gio_progress_line(cleaned, &transferred, &total) == 0) {
+                        report_transfer_progress(progress, relative_path, transferred, total);
+                    } else {
+                        snprintf(last_output, sizeof(last_output), "%s", cleaned);
+                    }
+                }
+                line_used = 0;
+                continue;
+            }
+
+            if (line_used + 1 < sizeof(line_buffer)) {
+                line_buffer[line_used++] = (char)ch;
+            }
+        }
+    }
+    close(pipe_fds[0]);
+
+    if (bytes_read < 0) {
+        set_error(err, err_size, "Cannot read subprocess output: %s", strerror(errno));
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+
+    if (line_used > 0) {
+        char cleaned[512];
+        unsigned long long transferred = 0;
+        unsigned long long total = 0;
+
+        line_buffer[line_used] = '\0';
+        strip_control_sequences(line_buffer, cleaned, sizeof(cleaned));
+        if (cleaned[0] != '\0') {
+            if (parse_gio_progress_line(cleaned, &transferred, &total) == 0) {
+                report_transfer_progress(progress, relative_path, transferred, total);
+            } else {
+                snprintf(last_output, sizeof(last_output), "%s", cleaned);
+            }
+        }
+    }
+
+    if (waitpid(pid, &status, 0) < 0) {
+        set_error(err, err_size, "Cannot wait for subprocess: %s", strerror(errno));
+        return -1;
+    }
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return 0;
+    }
+
+    if (last_output[0] != '\0') {
+        set_error(err, err_size, "%s", last_output);
+    } else if (WIFEXITED(status)) {
+        set_error(err, err_size, "%s exited with status %d", argv[0], WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        set_error(err, err_size, "%s terminated by signal %d", argv[0], WTERMSIG(status));
+    } else {
+        set_error(err, err_size, "%s failed", argv[0]);
+    }
+
+    return -1;
 }
 
 static const char *path_basename(const char *path) {
@@ -508,34 +799,48 @@ static int prepare_target_path(const char *target_path, NodeKind expected_kind, 
     return ensure_parent_directory(target_path, err, err_size);
 }
 
-static int copy_file_contents(const char *source_path, const char *target_path, char *err, size_t err_size) {
+static int copy_file_contents(
+    const char *source_path,
+    const char *target_path,
+    const char *relative_path,
+    TransferContext *progress,
+    char *err,
+    size_t err_size
+) {
     int source_fd = -1;
     int target_fd = -1;
     struct stat st;
     char buffer[65536];
     ssize_t bytes_read;
+    unsigned long long current_file_bytes = 0;
 
     if (ensure_parent_directory(target_path, err, err_size) != 0) {
         return -1;
     }
 
+    if (stat(source_path, &st) != 0) {
+        set_error(err, err_size, "Cannot inspect '%s': %s", source_path, strerror(errno));
+        return -1;
+    }
+
     if (subsync_target_uses_gio(source_path) || subsync_target_uses_gio(target_path)) {
-        int rc = gio_copy_file(source_path, target_path, err, err_size);
+        int rc;
+
+        report_transfer_progress(progress, relative_path, 0, (unsigned long long)st.st_size);
+        rc = gio_copy_file(source_path, target_path, relative_path, progress, err, err_size);
         if (rc != 0) {
             rewrite_gvfs_error_if_needed(source_path, target_path, err, err_size);
+            return rc;
         }
-        return rc;
+
+        report_transfer_progress(progress, relative_path, (unsigned long long)st.st_size, (unsigned long long)st.st_size);
+        finish_transferred_file(progress, (unsigned long long)st.st_size);
+        return 0;
     }
 
     source_fd = open(source_path, O_RDONLY);
     if (source_fd < 0) {
         set_error(err, err_size, "Cannot open '%s': %s", source_path, strerror(errno));
-        return -1;
-    }
-
-    if (fstat(source_fd, &st) != 0) {
-        set_error(err, err_size, "Cannot inspect '%s': %s", source_path, strerror(errno));
-        close(source_fd);
         return -1;
     }
 
@@ -545,16 +850,22 @@ static int copy_file_contents(const char *source_path, const char *target_path, 
             int rc;
 
             close(source_fd);
-            rc = gio_copy_file(source_path, target_path, err, err_size);
+            report_transfer_progress(progress, relative_path, 0, (unsigned long long)st.st_size);
+            rc = gio_copy_file(source_path, target_path, relative_path, progress, err, err_size);
             if (rc != 0) {
                 rewrite_gvfs_error_if_needed(source_path, target_path, err, err_size);
+                return rc;
             }
-            return rc;
+            report_transfer_progress(progress, relative_path, (unsigned long long)st.st_size, (unsigned long long)st.st_size);
+            finish_transferred_file(progress, (unsigned long long)st.st_size);
+            return 0;
         }
         set_error(err, err_size, "Cannot create '%s': %s", target_path, strerror(errno));
         close(source_fd);
         return -1;
     }
+
+    report_transfer_progress(progress, relative_path, 0, (unsigned long long)st.st_size);
 
     while ((bytes_read = read(source_fd, buffer, sizeof(buffer))) > 0) {
         ssize_t total_written = 0;
@@ -569,6 +880,9 @@ static int copy_file_contents(const char *source_path, const char *target_path, 
             }
             total_written += bytes_written;
         }
+
+        current_file_bytes += (unsigned long long)bytes_read;
+        report_transfer_progress(progress, relative_path, current_file_bytes, (unsigned long long)st.st_size);
     }
 
     if (bytes_read < 0) {
@@ -580,6 +894,8 @@ static int copy_file_contents(const char *source_path, const char *target_path, 
 
     close(source_fd);
     close(target_fd);
+    report_transfer_progress(progress, relative_path, (unsigned long long)st.st_size, (unsigned long long)st.st_size);
+    finish_transferred_file(progress, (unsigned long long)st.st_size);
     return 0;
 }
 
@@ -587,6 +903,7 @@ static int copy_source_node_recursive(
     const char *source_root,
     const char *target_root,
     const Node *node,
+    TransferContext *progress,
     char *err,
     size_t err_size
 ) {
@@ -626,7 +943,7 @@ static int copy_source_node_recursive(
             return -1;
         }
 
-        if (copy_file_contents(source_path, target_path, err, err_size) != 0) {
+        if (copy_file_contents(source_path, target_path, node->relative_path, progress, err, err_size) != 0) {
             free(source_path);
             free(target_path);
             return -1;
@@ -652,7 +969,7 @@ static int copy_source_node_recursive(
         if (node->children[i]->origin != ORIGIN_SOURCE) {
             continue;
         }
-        if (copy_source_node_recursive(source_root, target_root, node->children[i], err, err_size) != 0) {
+        if (copy_source_node_recursive(source_root, target_root, node->children[i], progress, err, err_size) != 0) {
             return -1;
         }
     }
@@ -665,8 +982,17 @@ int copy_source_node_to_target(
     const char *target_root,
     const Node *node,
     char *err,
-    size_t err_size
+    size_t err_size,
+    TransferProgressFn progress_fn,
+    void *progress_userdata
 ) {
+    TransferContext progress = {
+        .fn = progress_fn,
+        .userdata = progress_userdata,
+        .files_completed = 0,
+        .bytes_completed = 0
+    };
+
     if (err != NULL && err_size > 0) {
         err[0] = '\0';
     }
@@ -676,17 +1002,22 @@ int copy_source_node_to_target(
         return -1;
     }
 
-    return copy_source_node_recursive(source_root, target_root, node, err, err_size);
+    return copy_source_node_recursive(source_root, target_root, node, &progress, err, err_size);
 }
 
 int remove_target_for_source_node(
     const char *target_root,
     const Node *node,
     char *err,
-    size_t err_size
+    size_t err_size,
+    TransferProgressFn progress_fn,
+    void *progress_userdata
 ) {
     char *target_path;
     int rc;
+
+    (void)progress_fn;
+    (void)progress_userdata;
 
     if (err != NULL && err_size > 0) {
         err[0] = '\0';
