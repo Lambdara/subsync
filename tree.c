@@ -686,6 +686,7 @@ static size_t recompute_node(Node *node) {
 
     node->checked = node->target_match;
     node->has_overlap = node->target_match;
+    node->has_descendant_overlap = false;
     node->hidden_target_only_count = 0;
     node->replacement_delete_count = node->target_conflict ? node->conflict_target_item_count : 0;
 
@@ -707,6 +708,7 @@ static size_t recompute_node(Node *node) {
         }
         if (child->has_overlap) {
             node->has_overlap = true;
+            node->has_descendant_overlap = true;
         }
         if (node->target_match) {
             node->hidden_target_only_count += child->hidden_target_only_count;

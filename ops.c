@@ -117,6 +117,27 @@ bool subsync_target_uses_gio(const char *path) {
            strstr(path, "/gvfs/") != NULL;
 }
 
+bool subsync_target_uses_android_mtp(const char *path) {
+    const char *gvfs;
+
+    if (env_flag_enabled("SUBSYNC_FORCE_ANDROID_MTP") ||
+        env_flag_enabled("SUBSYNC_FORCE_MTP")) {
+        return true;
+    }
+
+    if (path == NULL) {
+        return false;
+    }
+
+    gvfs = strstr(path, "/gvfs/");
+    if (gvfs == NULL) {
+        return false;
+    }
+
+    gvfs += strlen("/gvfs/");
+    return strncmp(gvfs, "mtp:", 4) == 0;
+}
+
 static void trim_trailing_newlines(char *value) {
     size_t len;
 
@@ -131,31 +152,150 @@ static void trim_trailing_newlines(char *value) {
     }
 }
 
-static bool name_has_known_mtp_problem(const char *name) {
-    return name != NULL && strchr(name, ':') != NULL;
+static bool android_mtp_filename_char_is_forbidden(unsigned char ch) {
+    if (ch <= 0x1f || ch == 0x7f) {
+        return true;
+    }
+
+    switch (ch) {
+        case '"':
+        case '*':
+        case '/':
+        case ':':
+        case '<':
+        case '>':
+        case '?':
+        case '\\':
+        case '|':
+            return true;
+        default:
+            return false;
+    }
 }
 
-static int validate_known_mtp_constraints(
-    const char *target_path,
+static void format_android_mtp_forbidden_char(unsigned char ch, char *buffer, size_t buffer_size) {
+    switch (ch) {
+        case '"':
+            snprintf(buffer, buffer_size, "'\"'");
+            return;
+        case '\\':
+            snprintf(buffer, buffer_size, "'\\\\'");
+            return;
+        case 0x7f:
+            snprintf(buffer, buffer_size, "control character 0x7F");
+            return;
+        default:
+            if (ch < 0x20) {
+                snprintf(buffer, buffer_size, "control character 0x%02X", ch);
+            } else {
+                snprintf(buffer, buffer_size, "'%c'", ch);
+            }
+            return;
+    }
+}
+
+static int describe_android_mtp_filename_problem(
+    const char *name,
+    char *problem,
+    size_t problem_size
+) {
+    size_t i;
+
+    if (name == NULL || name[0] == '\0') {
+        snprintf(problem, problem_size, "is empty");
+        return -1;
+    }
+
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        snprintf(problem, problem_size, "is reserved");
+        return -1;
+    }
+
+    for (i = 0; name[i] != '\0'; ++i) {
+        unsigned char ch = (unsigned char)name[i];
+
+        if (android_mtp_filename_char_is_forbidden(ch)) {
+            char char_text[64];
+
+            format_android_mtp_forbidden_char(ch, char_text, sizeof(char_text));
+            snprintf(problem, problem_size, "contains %s", char_text);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int validate_android_mtp_filename_component(
+    const char *target_root,
+    const char *relative_path,
     const char *display_name,
     char *err,
     size_t err_size
 ) {
-    if (!subsync_target_uses_gio(target_path)) {
+    char problem[96];
+
+    if (!subsync_target_uses_android_mtp(target_root)) {
         return 0;
     }
 
-    if (name_has_known_mtp_problem(display_name)) {
+    if (describe_android_mtp_filename_problem(display_name, problem, sizeof(problem)) != 0) {
         set_error(
             err,
             err_size,
-            "Android MTP rejected '%s'. The filename contains ':', which many phone storage backends do not allow.",
-            display_name
+            "Android/MTP target cannot accept '%s': filename component '%s' %s. "
+            "Rename it before copying to the phone. Forbidden characters: \" * / : < > ? \\ | and control characters.",
+            relative_path != NULL && relative_path[0] != '\0' ? relative_path : display_name,
+            display_name != NULL ? display_name : "",
+            problem
         );
         return -1;
     }
 
     return 0;
+}
+
+static int validate_android_mtp_source_node_recursive(
+    const char *target_root,
+    const Node *node,
+    char *err,
+    size_t err_size
+) {
+    size_t i;
+
+    if (node->origin != ORIGIN_SOURCE) {
+        return 0;
+    }
+
+    if (validate_android_mtp_filename_component(target_root, node->relative_path, node->name, err, err_size) != 0) {
+        return -1;
+    }
+
+    for (i = 0; i < node->child_count; ++i) {
+        if (validate_android_mtp_source_node_recursive(target_root, node->children[i], err, err_size) != 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+int subsync_validate_source_node_for_target(
+    const char *target_root,
+    const Node *node,
+    char *err,
+    size_t err_size
+) {
+    if (err != NULL && err_size > 0) {
+        err[0] = '\0';
+    }
+
+    if (node == NULL || node->origin != ORIGIN_SOURCE) {
+        set_error(err, err_size, "No source item is selected");
+        return -1;
+    }
+
+    return validate_android_mtp_source_node_recursive(target_root, node, err, err_size);
 }
 
 static int run_command_capture_stderr(const char *const argv[], char *err, size_t err_size) {
@@ -588,23 +728,20 @@ static void rewrite_gvfs_error_if_needed(
     source_name = path_basename(source_path);
 
     if (strstr(err, "libmtp error:  Could not send object.") != NULL &&
-        name_has_known_mtp_problem(source_name)) {
-        set_error(
-            err,
-            err_size,
-            "Android MTP rejected '%s'. The filename contains ':', which many phone storage backends do not allow.",
-            source_name
-        );
+        validate_android_mtp_filename_component(target_path, source_name, source_name, err, err_size) != 0) {
         return;
     }
 
     if (strstr(err, "libmtp error") != NULL) {
+        char original[512];
+
+        snprintf(original, sizeof(original), "%s", err);
         set_error(
             err,
             err_size,
             "MTP transfer failed for '%s': %s",
             source_name,
-            err
+            original
         );
     }
 }
@@ -924,7 +1061,7 @@ static int copy_source_node_recursive(
         return -1;
     }
 
-    if (validate_known_mtp_constraints(target_path, node->name, err, err_size) != 0) {
+    if (validate_android_mtp_filename_component(target_root, node->relative_path, node->name, err, err_size) != 0) {
         free(source_path);
         free(target_path);
         return -1;
@@ -999,6 +1136,10 @@ int copy_source_node_to_target(
 
     if (node == NULL || node->origin != ORIGIN_SOURCE) {
         set_error(err, err_size, "No source item is selected");
+        return -1;
+    }
+
+    if (subsync_validate_source_node_for_target(target_root, node, err, err_size) != 0) {
         return -1;
     }
 

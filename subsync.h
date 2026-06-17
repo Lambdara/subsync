@@ -30,6 +30,7 @@ struct Node {
     size_t conflict_target_item_count;
     bool checked;
     bool has_overlap;
+    bool has_descendant_overlap;
     bool expanded;
     size_t hidden_target_only_count;
     size_t replacement_delete_count;
@@ -88,6 +89,13 @@ void tree_free(Tree *tree);
 Node *tree_find_source_node(Node *root, const char *relative_path);
 size_t tree_collect_visible(Node *root, bool show_target_only, VisibleRow **out_rows);
 bool subsync_target_uses_gio(const char *path);
+bool subsync_target_uses_android_mtp(const char *path);
+int subsync_validate_source_node_for_target(
+    const char *target_root,
+    const Node *node,
+    char *err,
+    size_t err_size
+);
 
 int copy_source_node_to_target(
     const char *source_root,

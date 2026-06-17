@@ -95,6 +95,7 @@ The top-right queue indicator shows the current total queued workload in files a
 
 - `[x]` item exists on the target
 - `[ ]` item is missing on the target
+- `d` target directory exists, but none of its source contents exist below it
 - `~` source subtree is only partially present on the target
 - `!` checking or deleting this node will delete or replace extra target content
 - `*` a transfer is queued or running for this item or an overlapping subtree

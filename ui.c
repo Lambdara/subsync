@@ -73,6 +73,7 @@ typedef struct {
     TreeBuildProgress progress;
     char current_path[512];
     double last_render_at;
+    bool compact;
 } LoadingState;
 
 static int reload_tree(UiState *ui, const char *selected_path);
@@ -1008,6 +1009,152 @@ static size_t find_index_for_path(VisibleRow *rows, size_t count, const char *re
     return 0;
 }
 
+static double loading_directory_ratio(const LoadingState *loading) {
+    double directory_ratio = 0.0;
+
+    if (loading->progress.directories_discovered > 0) {
+        directory_ratio =
+            (double)loading->progress.directories_completed / (double)loading->progress.directories_discovered;
+    }
+    if (directory_ratio > 1.0) {
+        directory_ratio = 1.0;
+    }
+
+    return directory_ratio;
+}
+
+static void format_loading_phase(const LoadingState *loading, char *buffer, size_t buffer_size) {
+    if (loading->progress.directories_discovered == 0) {
+        snprintf(
+            buffer,
+            buffer_size,
+            "%s  starting...",
+            loading->progress.phase == TREE_PROGRESS_TARGET ? "Scanning target" : "Scanning source"
+        );
+        return;
+    }
+
+    snprintf(
+        buffer,
+        buffer_size,
+        "%s  %zu/%zu directories",
+        loading->progress.phase == TREE_PROGRESS_TARGET ? "Scanning target" : "Scanning source",
+        loading->progress.directories_completed,
+        loading->progress.directories_discovered
+    );
+}
+
+static void format_loading_counts(const LoadingState *loading, char *buffer, size_t buffer_size) {
+    snprintf(
+        buffer,
+        buffer_size,
+        "%zu source entries  |  %zu target entries  |  %zu nodes",
+        loading->progress.source_entries_scanned,
+        loading->progress.target_entries_scanned,
+        loading->progress.nodes_created
+    );
+}
+
+static void draw_loading_bar(const LoadingState *loading, int bar_width) {
+    double directory_ratio = loading_directory_ratio(loading);
+    int base_fill;
+    int pulse_width;
+    int pulse_cycle;
+    int pulse_offset;
+    int i;
+
+    if (bar_width < 1) {
+        return;
+    }
+
+    base_fill = (int)(directory_ratio * (double)bar_width);
+    if (base_fill > bar_width) {
+        base_fill = bar_width;
+    }
+
+    pulse_width = bar_width / 6;
+    if (pulse_width < 3) {
+        pulse_width = 3;
+    }
+    if (pulse_width > 8) {
+        pulse_width = 8;
+    }
+
+    pulse_cycle = bar_width + pulse_width;
+    pulse_offset = (int)(
+        (loading->progress.source_entries_scanned +
+         loading->progress.target_entries_scanned +
+         loading->progress.nodes_created) %
+        (size_t)pulse_cycle
+    ) - pulse_width;
+
+    for (i = 0; i < bar_width; ++i) {
+        bool in_pulse = i >= pulse_offset && i < pulse_offset + pulse_width;
+        char ch = i < base_fill ? '#' : '-';
+
+        if (i >= base_fill && in_pulse) {
+            ch = '=';
+        }
+        addch(ch);
+    }
+}
+
+static void render_compact_loading_screen(const LoadingState *loading) {
+    char counts_line[256];
+    char current_line[1024];
+    char header_line[512];
+    char phase_line[256];
+    int bar_width;
+
+    if (LINES <= 0 || COLS <= 0) {
+        return;
+    }
+
+    format_loading_phase(loading, phase_line, sizeof(phase_line));
+    snprintf(header_line, sizeof(header_line), "%s  %s", loading->title, phase_line);
+
+    attron(A_REVERSE);
+    mvaddnstr(0, 0, header_line, COLS - 1);
+    clrtoeol();
+    attroff(A_REVERSE);
+
+    if (LINES > 1) {
+        format_loading_counts(loading, counts_line, sizeof(counts_line));
+        move(1, 0);
+        if (COLS >= 32) {
+            bar_width = COLS / 3;
+            if (bar_width > 24) {
+                bar_width = 24;
+            }
+            if (bar_width < 8) {
+                bar_width = 8;
+            }
+
+            addch('[');
+            draw_loading_bar(loading, bar_width);
+            addch(']');
+            addch(' ');
+            addnstr(counts_line, COLS - getcurx(stdscr) - 1);
+        } else {
+            addnstr(counts_line, COLS - 1);
+        }
+        clrtoeol();
+    }
+
+    if (LINES > 2) {
+        snprintf(
+            current_line,
+            sizeof(current_line),
+            "Current: %s",
+            loading->current_path[0] != '\0' ? loading->current_path : "(starting)"
+        );
+        mvaddnstr(2, 0, current_line, COLS - 1);
+        clrtoeol();
+    }
+
+    refresh();
+}
+
 static void render_loading_screen(const LoadingState *loading) {
     char counts_line[256];
     char phase_line[256];
@@ -1019,12 +1166,11 @@ static void render_loading_screen(const LoadingState *loading) {
     int phase_row = bar_row + 2;
     int counts_row = bar_row + 3;
     int current_row = bar_row + 5;
-    double directory_ratio = 0.0;
-    int base_fill;
-    int pulse_width;
-    int pulse_cycle;
-    int pulse_offset;
-    int i;
+
+    if (loading->compact) {
+        render_compact_loading_screen(loading);
+        return;
+    }
 
     if (bar_width > COLS - 2) {
         bar_width = COLS - 2;
@@ -1052,35 +1198,6 @@ static void render_loading_screen(const LoadingState *loading) {
         current_row = LINES - 1;
     }
 
-    if (loading->progress.directories_discovered > 0) {
-        directory_ratio =
-            (double)loading->progress.directories_completed / (double)loading->progress.directories_discovered;
-    }
-    if (directory_ratio > 1.0) {
-        directory_ratio = 1.0;
-    }
-
-    base_fill = (int)(directory_ratio * (double)bar_width);
-    if (base_fill > bar_width) {
-        base_fill = bar_width;
-    }
-
-    pulse_width = bar_width / 6;
-    if (pulse_width < 3) {
-        pulse_width = 3;
-    }
-    if (pulse_width > 8) {
-        pulse_width = 8;
-    }
-
-    pulse_cycle = bar_width + pulse_width;
-    pulse_offset = (int)(
-        (loading->progress.source_entries_scanned +
-         loading->progress.target_entries_scanned +
-         loading->progress.nodes_created) %
-        (size_t)pulse_cycle
-    ) - pulse_width;
-
     erase();
     mvprintw(title_row, 0, "%s", loading->title);
     clrtoeol();
@@ -1091,46 +1208,15 @@ static void render_loading_screen(const LoadingState *loading) {
 
     move(bar_row, 0);
     addch('[');
-    for (i = 0; i < bar_width; ++i) {
-        bool in_pulse = i >= pulse_offset && i < pulse_offset + pulse_width;
-        char ch = i < base_fill ? '#' : '-';
-
-        if (i >= base_fill && in_pulse) {
-            ch = '=';
-        }
-        addch(ch);
-    }
+    draw_loading_bar(loading, bar_width);
     addch(']');
     clrtoeol();
 
-    if (loading->progress.directories_discovered == 0) {
-        snprintf(
-            phase_line,
-            sizeof(phase_line),
-            "%s  starting...",
-            loading->progress.phase == TREE_PROGRESS_TARGET ? "Scanning target" : "Scanning source"
-        );
-    } else {
-        snprintf(
-            phase_line,
-            sizeof(phase_line),
-            "%s  %zu/%zu directories",
-            loading->progress.phase == TREE_PROGRESS_TARGET ? "Scanning target" : "Scanning source",
-            loading->progress.directories_completed,
-            loading->progress.directories_discovered
-        );
-    }
+    format_loading_phase(loading, phase_line, sizeof(phase_line));
     mvaddnstr(phase_row, 0, phase_line, COLS - 1);
     clrtoeol();
 
-    snprintf(
-        counts_line,
-        sizeof(counts_line),
-        "%zu source entries  |  %zu target entries  |  %zu nodes",
-        loading->progress.source_entries_scanned,
-        loading->progress.target_entries_scanned,
-        loading->progress.nodes_created
-    );
+    format_loading_counts(loading, counts_line, sizeof(counts_line));
     mvaddnstr(counts_row, 0, counts_line, COLS - 1);
     clrtoeol();
 
@@ -1157,6 +1243,7 @@ static void handle_tree_build_progress(const TreeBuildProgress *progress, void *
 static int reload_tree(UiState *ui, const char *selected_path) {
     char err[512];
     StringList expanded = {0};
+    char *selected_path_copy = NULL;
     Tree *next_tree;
     LoadingState loading = {
         .title = ui->tree == NULL ? "Loading tree..." : "Reloading tree...",
@@ -1167,11 +1254,21 @@ static int reload_tree(UiState *ui, const char *selected_path) {
             .directories_discovered = 1
         },
         .current_path = "",
-        .last_render_at = 0.0
+        .last_render_at = 0.0,
+        .compact = ui->tree != NULL
     };
 
     if (ui->tree != NULL) {
         collect_expanded_paths(ui->tree->root, &expanded);
+    }
+
+    if (selected_path != NULL) {
+        selected_path_copy = dup_string(selected_path);
+        if (selected_path_copy == NULL) {
+            string_list_free(&expanded);
+            set_status(ui, "Out of memory while preserving the current selection.");
+            return -1;
+        }
     }
 
     sanitize_display_text(loading.current_path, sizeof(loading.current_path), ui->source_root);
@@ -1188,6 +1285,7 @@ static int reload_tree(UiState *ui, const char *selected_path) {
         &loading
     );
     if (next_tree == NULL) {
+        free(selected_path_copy);
         string_list_free(&expanded);
         snprintf(ui->status, sizeof(ui->status), "%s", err[0] != '\0' ? err : "Failed to reload the tree");
         return -1;
@@ -1203,11 +1301,11 @@ static int reload_tree(UiState *ui, const char *selected_path) {
         set_status(ui, "Skipped %zu unsupported source entries.", next_tree->skipped_source_entries);
     }
 
-    if (selected_path != NULL) {
+    if (selected_path_copy != NULL) {
         VisibleRow *rows = NULL;
         size_t count = tree_collect_visible(next_tree->root, ui->show_target_only, &rows);
         if (rows != NULL && count > 0) {
-            ui->selected_index = find_index_for_path(rows, count, selected_path);
+            ui->selected_index = find_index_for_path(rows, count, selected_path_copy);
         } else {
             ui->selected_index = 0;
         }
@@ -1216,6 +1314,7 @@ static int reload_tree(UiState *ui, const char *selected_path) {
         ui->selected_index = 0;
     }
 
+    free(selected_path_copy);
     string_list_free(&expanded);
     return 0;
 }
@@ -1250,6 +1349,14 @@ static void clamp_scroll(UiState *ui, size_t row_count, int list_height) {
     }
 }
 
+static bool node_is_target_directory_shell(const Node *node) {
+    return node->origin == ORIGIN_SOURCE &&
+           node->kind == NODE_DIR &&
+           node->target_match &&
+           !node->checked &&
+           !node->has_descendant_overlap;
+}
+
 static char status_marker(const Node *node) {
     if (node->origin == ORIGIN_TARGET_ONLY) {
         return ' ';
@@ -1257,6 +1364,9 @@ static char status_marker(const Node *node) {
     if ((node->checked && node->hidden_target_only_count > 0) ||
         (!node->checked && node->replacement_delete_count > 0)) {
         return '!';
+    }
+    if (node_is_target_directory_shell(node)) {
+        return 'd';
     }
     if (!node->checked && node->has_overlap) {
         return '~';
@@ -1496,11 +1606,32 @@ static void render_selected_summary(const UiState *ui, const Node *node) {
         return;
     }
 
+    if (node_is_target_directory_shell(node)) {
+        if (node->hidden_target_only_count > 0) {
+            mvprintw(
+                LINES - 1,
+                0,
+                "%s exists as a target directory, but none of its source contents are present. Copy leaves %zu extra target item(s).",
+                node->relative_path[0] != '\0' ? node->relative_path : ".",
+                node->hidden_target_only_count
+            );
+        } else {
+            mvprintw(
+                LINES - 1,
+                0,
+                "%s exists as a target directory, but none of its source contents are present. Enter queues the missing items.",
+                node->relative_path[0] != '\0' ? node->relative_path : "."
+            );
+        }
+        clrtoeol();
+        return;
+    }
+
     if (node->kind == NODE_DIR && node->has_overlap) {
         mvprintw(
             LINES - 1,
             0,
-            "%s is partially present on the target. Enter queues the missing source items.",
+            "%s is partially present on the target: some source contents already exist. Enter queues the missing items.",
             node->relative_path[0] != '\0' ? node->relative_path : "."
         );
         clrtoeol();
@@ -1584,6 +1715,7 @@ static void show_help(void) {
         "",
         "[x]      Present on target; directories mean the full source subtree exists",
         "[ ]      Missing on target",
+        "d        Target directory exists, but its source contents are missing",
         "~        Some of the source subtree is already present on the target",
         "!        Toggling this node deletes or replaces target-only target content",
         "*        A transfer is queued or running for this item or subtree",
@@ -1765,6 +1897,15 @@ static int queue_selected_node(UiState *ui, const Node *node, JobAction action) 
             node->relative_path[0] != '\0' ? node->relative_path : "."
         );
         return 0;
+    }
+
+    if (action == JOB_COPY) {
+        char err[512];
+
+        if (subsync_validate_source_node_for_target(ui->target_root, node, err, sizeof(err)) != 0) {
+            set_status(ui, "%s", err[0] != '\0' ? err : "The selected source item cannot be copied to the target.");
+            return 0;
+        }
     }
 
     if (action == JOB_COPY && node->replacement_delete_count > 0) {
